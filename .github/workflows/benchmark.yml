@@ -1,0 +1,138 @@
+name: Benchmark Suite (Doc_2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Benchmark suite to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - micro
+          - adaptive-compress
+          - dynamic-sched
+          - merkle-resume
+      repeats:
+        description: Number of iterations for Python benchmark scripts
+        required: false
+        default: '3'
+        type: string
+  push:
+    branches:
+      - dev
+    paths:
+      - 'croc-main/scripts/bench_*.py'
+      - 'croc-main/scripts/plot_results.py'
+      - '.github/workflows/benchmark.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Run Croc_Team-2 benchmarks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: croc-main/go.mod
+          cache-dependency-path: croc-main/go.sum
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install Linux networking tools (iproute2) for tc/netns suites
+        if: inputs.suite != 'micro'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2
+
+      - name: Build upgraded croc binary
+        working-directory: croc-main
+        run: |
+          mkdir -p bin ../results
+          CGO_ENABLED=0 go build -buildvcs=false -trimpath -tags netgo,osusergo -ldflags="-s -w -buildid=" -o bin/croc-upgraded .
+
+      - name: Run Go micro-benchmarks (CMP / SCH / MRK)
+        working-directory: croc-main
+        run: |
+          set -euo pipefail
+          PKGS="./src/compress ./src/croc"
+          if [ -d "./src/merkle" ] && ls ./src/merkle/*.go >/dev/null 2>&1; then
+            PKGS="$PKGS ./src/merkle"
+          fi
+          BENCH_PATTERN="Benchmark(TransferChunkCompression|IncompressibleChunkDecision|RequestedChunkQueue|Adaptive|Merkle)"
+          go test -run '^$' -bench "$BENCH_PATTERN" -benchmem -count=1 $PKGS | tee ../results/bench-go.txt
+
+      - name: Run Python Doc_2 benchmark scripts (if available)
+        env:
+          SUITE: ${{ inputs.suite || 'all' }}
+          REPEATS: ${{ inputs.repeats || '3' }}
+        run: |
+          set -euo pipefail
+          mkdir -p results
+
+          run_if_exists() {
+            local script_path="$1"
+            shift
+            if [[ -f "$script_path" ]]; then
+              echo "Running $script_path $*"
+              sudo -E python3 "$script_path" "$@"
+            else
+              echo "Skipping $script_path (script not added yet)."
+            fi
+          }
+
+          BASE_BIN="croc-main/bin/croc-base"
+          NEW_BIN="croc-main/bin/croc-upgraded"
+          if [[ ! -f "$BASE_BIN" ]]; then
+            echo "Note: $BASE_BIN not found; using $NEW_BIN as placeholder if script allows or skipping."
+          fi
+
+          if [[ "$SUITE" == "all" || "$SUITE" == "adaptive-compress" ]]; then
+            run_if_exists "croc-main/scripts/bench_adaptive_compress.py" --new "$NEW_BIN" --repeats "$REPEATS" --out results/cmp
+          fi
+          if [[ "$SUITE" == "all" || "$SUITE" == "dynamic-sched" ]]; then
+            run_if_exists "croc-main/scripts/bench_dynamic_sched.py" --new "$NEW_BIN" --repeats "$REPEATS" --out results/sch
+          fi
+          if [[ "$SUITE" == "all" || "$SUITE" == "merkle-resume" ]]; then
+            run_if_exists "croc-main/scripts/bench_merkle_resume.py" --new "$NEW_BIN" --repeats "$REPEATS" --out results/mrk
+          fi
+          if [[ -f "croc-main/scripts/plot_results.py" ]]; then
+            python3 croc-main/scripts/plot_results.py --input results --out results/plots || echo "plot_results.py skipped or needs full dataset"
+          fi
+
+      - name: Publish summary to GitHub Step Summary
+        if: always()
+        run: |
+          {
+            echo "## Croc_Team-2 Benchmark Summary"
+            echo ""
+            echo "Suite: \`${{ inputs.suite || 'all' }}\` · Repeats: \`${{ inputs.repeats || '3' }}\`"
+            echo ""
+            echo '```text'
+            cat results/bench-go.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: croc-benchmark-results
+          retention-days: 14
+          path: results/

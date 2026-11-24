@@ -1,0 +1,30 @@
+# GitHub CODEOWNERS cho dự án Croc_Team-2
+# Mặc định @Horuzyn là owner review chính cho toàn bộ repository.
+# Khi Nam, Sơn, Long tham gia repo với tài khoản GitHub cá nhân,
+# thay thế comment bên dưới bằng @github-username tương ứng.
+
+* @Horuzyn
+
+# --- Phân vùng 4 đầu việc của Team ---
+# [Đức - INT] Shared Contracts, CLI, Telemetry, Benchmarks, CI/CD & Lab
+/.github/ @Horuzyn
+/croc-main/src/cli/ @Horuzyn
+/croc-main/src/message/ @Horuzyn
+/croc-main/src/telemetry/ @Horuzyn
+/croc-main/scripts/ @Horuzyn
+/docs/04_Duc_INT_Integration_Benchmark_Lab.md @Horuzyn
+
+# [Nam - CMP] Nén thích ứng theo từng chunk
+# /croc-main/src/compress/ @<github-username-nam> @Horuzyn
+# /docs/01_Nam_CMP_Adaptive_Compression.md @<github-username-nam> @Horuzyn
+
+# [Sơn - SCH] Lập lịch chunk động & Work-Stealing đa luồng TCP
+# /croc-main/src/croc/chunk_queue.go @<github-username-son> @Horuzyn
+# /croc-main/src/croc/chunk_scheduler.go @<github-username-son> @Horuzyn
+# /croc-main/src/croc/stream_metrics.go @<github-username-son> @Horuzyn
+# /docs/02_Son_SCH_Dynamic_Scheduling.md @<github-username-son> @Horuzyn
+
+# [Long - MRK] Cây Merkle, Resume kiểm chứng & Truyền lại chọn lọc
+# /croc-main/src/merkle/ @<github-username-long> @Horuzyn
+# /croc-main/src/croc/file_manifest.go @<github-username-long> @Horuzyn
+# /docs/03_Long_MRK_Merkle_Resume.md @<github-username-long> @Horuzyn

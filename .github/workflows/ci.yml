@@ -1,0 +1,285 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - 'feat/**'
+  pull_request:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-24.04
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      docs: ${{ steps.filter.outputs.docs }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed files
+        id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            echo "docs=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.sha }}"
+          fi
+
+          ZERO_SHA="0000000000000000000000000000000000000000"
+          if [[ -z "$BASE_SHA" || "$BASE_SHA" == "$ZERO_SHA" ]]; then
+            echo "No valid base SHA (initial push/branch creation); running all checks."
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            echo "docs=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null); then
+            echo "git diff failed; falling back to running all checks."
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            echo "docs=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          GO_CHANGED="false"
+          DOCS_CHANGED="false"
+
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            case "$file" in
+              croc-main/*|.github/workflows/ci.yml)
+                GO_CHANGED="true"
+                ;;
+              docs/*|Doc_1.md|Doc_2.md|README.md|.github/README.md)
+                DOCS_CHANGED="true"
+                ;;
+            esac
+          done <<< "$CHANGED_FILES"
+
+          echo "go=$GO_CHANGED" >> "$GITHUB_OUTPUT"
+          echo "docs=$DOCS_CHANGED" >> "$GITHUB_OUTPUT"
+
+  docs-check:
+    name: Docs & Markdown link check
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Verify docs structure and relative links
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          docs_root = pathlib.Path("docs")
+          md_files = sorted(docs_root.rglob("*.md"))
+          expected = {
+              "docs/01_Nam_CMP_Adaptive_Compression.md",
+              "docs/02_Son_SCH_Dynamic_Scheduling.md",
+              "docs/03_Long_MRK_Merkle_Resume.md",
+              "docs/04_Duc_INT_Integration_Benchmark_Lab.md",
+          }
+          actual = {p.as_posix() for p in md_files}
+          assert actual == expected, f"Unexpected docs files: {actual} vs {expected}"
+
+          targets_to_check = list(md_files)
+          github_readme = pathlib.Path(".github/README.md")
+          if github_readme.exists():
+              targets_to_check.append(github_readme)
+
+          broken = []
+          for md in targets_to_check:
+              text = md.read_text(encoding="utf-8")
+              for m in re.finditer(r"\[[^\]]+\]\(([^)#]+)(?:#[^)]+)?\)", text):
+                  target = m.group(1)
+                  if target.startswith(("http://", "https://", "mailto:")):
+                      continue
+                  resolved = (md.parent / target).resolve()
+                  if not resolved.exists():
+                      broken.append((md.as_posix(), target))
+
+          assert not broken, f"Broken markdown links found: {broken}"
+          print(f"Verified {len(targets_to_check)} markdown files with 0 broken links.")
+          PY
+
+  go-vet-and-unit:
+    name: Go vet & unit tests
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: croc-main
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: croc-main/go.mod
+          cache-dependency-path: croc-main/go.sum
+
+      - name: Display Go version
+        run: go version
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run unit tests
+        run: go test -count=1 ./...
+
+  go-race-tests:
+    name: Go race detector tests
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: croc-main
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: croc-main/go.mod
+          cache-dependency-path: croc-main/go.sum
+
+      - name: Run race tests on core & new team packages
+        run: |
+          set -euo pipefail
+          PKGS="./src/compress ./src/message ./src/receivefs ./src/croc"
+          for pkg in ./src/merkle ./src/telemetry; do
+            if [ -d "$pkg" ] && ls "$pkg"/*.go >/dev/null 2>&1; then
+              PKGS="$PKGS $pkg"
+            fi
+          done
+          echo "Running go test -race on: $PKGS"
+          go test -race -count=1 $PKGS
+
+  smoke-build:
+    name: Cross-platform smoke build
+    needs:
+      - changes
+      - go-vet-and-unit
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: croc-main
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: croc-main/go.mod
+          cache-dependency-path: croc-main/go.sum
+
+      - name: Build Linux, macOS, and Windows binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          COMMON="-buildvcs=false -trimpath -tags netgo,osusergo"
+          STATIC_LDFLAGS='-s -w -buildid= -extldflags "-static"'
+          STD_LDFLAGS='-s -w -buildid='
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $COMMON -ldflags "$STATIC_LDFLAGS" -o dist/croc-linux-amd64 .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $COMMON -ldflags "$STD_LDFLAGS" -o dist/croc-darwin-arm64 .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $COMMON -ldflags "$STD_LDFLAGS" -o dist/croc-windows-amd64.exe .
+
+          if ldd dist/croc-linux-amd64 2>&1 | grep -q "not a dynamic executable"; then
+            echo "Static binary confirmed: dist/croc-linux-amd64"
+          else
+            echo "Expected static Linux executable for dist/croc-linux-amd64"
+            exit 1
+          fi
+
+          (cd dist && sha256sum croc-linux-amd64 croc-darwin-arm64 croc-windows-amd64.exe > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload CI build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: croc-ci-binaries
+          retention-days: 7
+          path: croc-main/dist/
+
+  ci-gate:
+    name: CI Gate
+    needs:
+      - docs-check
+      - go-vet-and-unit
+      - go-race-tests
+      - smoke-build
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Evaluate all required CI checks
+        run: |
+          set -euo pipefail
+          statuses=(
+            "docs-check:${{ needs.docs-check.result }}"
+            "go-vet-and-unit:${{ needs.go-vet-and-unit.result }}"
+            "go-race-tests:${{ needs.go-race-tests.result }}"
+            "smoke-build:${{ needs.smoke-build.result }}"
+          )
+          for entry in "${statuses[@]}"; do
+            name="${entry%%:*}"
+            result="${entry##*:}"
+            echo "$name => $result"
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              echo "CI Gate failed because $name finished with status '$result'"
+              exit 1
+            fi
+          done
+          echo "CI Gate passed."

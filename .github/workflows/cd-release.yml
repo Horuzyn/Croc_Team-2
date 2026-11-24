@@ -1,0 +1,111 @@
+name: CD Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v0.1.0-day4 or v1.0.0)
+        required: true
+        type: string
+      prerelease:
+        description: Mark release as pre-release
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cd-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Pre-release verification
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: croc-main
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: croc-main/go.mod
+          cache-dependency-path: croc-main/go.sum
+
+      - name: Run go vet & full unit tests
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+
+      - name: Run race tests on core & team packages
+        run: |
+          set -euo pipefail
+          PKGS="./src/compress ./src/message ./src/receivefs ./src/croc"
+          for pkg in ./src/merkle ./src/telemetry; do
+            if [ -d "$pkg" ] && ls "$pkg"/*.go >/dev/null 2>&1; then
+              PKGS="$PKGS $pkg"
+            fi
+          done
+          go test -race -count=1 $PKGS
+
+  release:
+    name: Build & Publish GitHub Release
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: croc-main/go.mod
+          cache-dependency-path: croc-main/go.sum
+
+      - name: Build release binaries & checksums
+        working-directory: croc-main
+        run: |
+          set -euo pipefail
+          mkdir -p release-dist
+          COMMON="-buildvcs=false -trimpath -tags netgo,osusergo"
+          STATIC_LDFLAGS='-s -w -buildid= -extldflags "-static"'
+          STD_LDFLAGS='-s -w -buildid='
+
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $COMMON -ldflags "$STATIC_LDFLAGS" -o release-dist/croc-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $COMMON -ldflags "$STATIC_LDFLAGS" -o release-dist/croc-linux-arm64 .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $COMMON -ldflags "$STD_LDFLAGS" -o release-dist/croc-darwin-arm64 .
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $COMMON -ldflags "$STD_LDFLAGS" -o release-dist/croc-windows-amd64.exe .
+
+          (cd release-dist && sha256sum croc-* > SHA256SUMS.txt)
+          ls -lh release-dist
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          IS_PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || contains(github.ref_name, '-') }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME already exists; uploading updated assets."
+            gh release upload "$TAG_NAME" croc-main/release-dist/* --clobber
+          else
+            FLAGS=(--generate-notes --title "Croc_Team-2 $TAG_NAME")
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              FLAGS+=(--prerelease)
+            fi
+            gh release create "$TAG_NAME" croc-main/release-dist/* "${FLAGS[@]}"
+          fi

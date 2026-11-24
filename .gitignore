@@ -1,0 +1,32 @@
+# Dữ liệu kiểm thử dung lượng lớn (tránh vượt giới hạn 100 MB của GitHub)
+testfile_*.bin
+dataset_*.bin
+dataset_*.log
+dataset_*.zip
+*.pcapng
+*.tar.gz
+*.zip
+
+# Telemetry & kết quả benchmark sinh tự động
+*.jsonl
+results/
+Captures/
+
+# Sản phẩm biên dịch Go & file tạm
+croc-main/croc
+croc-main/croc-update
+croc-main/croc-web
+croc-main/bin/
+croc-main/dist/
+croc-main/release-dist/
+croc-main/tmp/
+*.exe
+*.out
+*.prof
+
+# Python & IDE/OS
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+Thumbs.db
