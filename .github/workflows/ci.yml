@@ -237,10 +237,12 @@ jobs:
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $COMMON -ldflags "$STD_LDFLAGS" -o dist/croc-darwin-arm64 .
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $COMMON -ldflags "$STD_LDFLAGS" -o dist/croc-windows-amd64.exe .
 
-          if ldd dist/croc-linux-amd64 2>&1 | grep -q "not a dynamic executable"; then
+          LDD_OUT=$(ldd dist/croc-linux-amd64 2>&1 || true)
+          if grep -q "not a dynamic executable" <<< "$LDD_OUT"; then
             echo "Static binary confirmed: dist/croc-linux-amd64"
           else
-            echo "Expected static Linux executable for dist/croc-linux-amd64"
+            echo "Expected static Linux executable for dist/croc-linux-amd64, got:"
+            echo "$LDD_OUT"
             exit 1
           fi
 
