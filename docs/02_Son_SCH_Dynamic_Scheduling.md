@@ -80,7 +80,7 @@ flowchart LR
 
 ## 5. Danh sách Tasks Chi tiết của Sơn (`SCH-01` → `SCH-06`)
 
-- [ ] **`SCH-01`: Thiết kế Kiến trúc Dynamic Scheduler & Work-Stealing** *(Ngày 1)*
+- [x] **`SCH-01`: Thiết kế Kiến trúc Dynamic Scheduler & Work-Stealing** *(Ngày 1)*
   - **Mô tả kỹ thuật:** Phân tích [chunk_queue.go](../croc-main/src/croc/chunk_queue.go), thiết kế trạng thái cho từng chunk (`Pending`, `InFlight{workerID, startedAt}`, `Done`), định nghĩa interface `ChunkScheduler` gồm `Claim(workerID)`, `Complete(workerID, offset, bytes, dur)`, `Steal(workerID)` và `ReenqueueRanges(ranges []int64)`.
   - **Phụ thuộc:** Nhận spec CLI flag & telemetry từ **Đức (`INT-01`)**; thống nhất chữ ký `ReenqueueRanges` với **Long (`MRK-01`)**.
   - **Tiêu chí hoàn thành (DoD):** Chốt xong thiết kế interface và đảm bảo không giữ lock `mu` khi thực hiện network/disk I/O.
@@ -90,7 +90,7 @@ flowchart LR
   - **Phụ thuộc:** Sử dụng `telemetry.Sink` từ **Đức (`INT-01`)**.
   - **Tiêu chí hoàn thành (DoD):** Unit test `stream_metrics_test.go` phát hiện chính xác một luồng suy giảm tốc độ > 50% trong vòng < 1 giây.
 
-- [ ] **`SCH-03`: Cài đặt Hàng đợi Động & Cơ chế Work-Stealing** *(Ngày 2)*
+- [x] **`SCH-03`: Cài đặt Hàng đợi Động & Cơ chế Work-Stealing** *(Ngày 2)*
   - **Mô tả kỹ thuật:** Trong `src/croc/chunk_scheduler.go`: luồng `Fast` nhận chunk liên tục không trễ; luồng `Slow` chịu pacing/cooldown giảm tải. Khi hàng đợi `Pending` cạn hoặc một chunk `InFlight` vượt ngưỡng (`elapsed > 3 * median_chunk_time`), luồng `Fast` được phép **steal** chunk đó để gửi song song mà không hủy socket cũ.
   - **Phụ thuộc:** Độc lập với mạng thực qua mock worker tests.
   - **Tiêu chí hoàn thành (DoD):** Unit test `chunk_scheduler_test.go` với 4 worker (1 worker chậm 10×): tổng thời gian giảm rõ rệt, mọi chunk hoàn tất đúng, không deadlock hay livelock.
