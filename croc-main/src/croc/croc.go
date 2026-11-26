@@ -48,6 +48,7 @@ import (
 	"github.com/schollz/croc/v11/src/redact"
 	"github.com/schollz/croc/v11/src/tailcattransport"
 	"github.com/schollz/croc/v11/src/tcp"
+	"github.com/schollz/croc/v11/src/telemetry"
 	"github.com/schollz/croc/v11/src/termui"
 	"github.com/schollz/croc/v11/src/utils"
 )
@@ -145,6 +146,13 @@ type Options struct {
 	// stdin. It runs on a croc goroutine and must return when ctx ends. An
 	// error other than ctx's counts as no.
 	Prompt func(ctx context.Context, q Question) (bool, error) `json:"-"`
+
+	// Croc_Team-2 upgrades. The zero values keep the original behaviour.
+	AdaptiveCompress    bool
+	SchedMode           string // "", "static" or "dynamic"
+	MerkleResume        bool
+	MetricsOut          string // JSONL path; empty disables telemetry
+	DebugThrottleWorker string // "<id>:<rate>", testing only
 }
 
 // TransportMode controls how a sender selects the file-data connection after
@@ -260,6 +268,7 @@ type Client struct {
 	reconnectVersion           int
 	peerReconnectVersion       int
 	peerPerFileCompression     bool
+	metrics                    telemetry.Sink // never nil after New
 	peerInlineMetadata         bool
 	peerProgressiveHash        bool
 	peerChunkedFileInfo        bool
@@ -500,6 +509,7 @@ func newClient(ops Options, transport tailcatDataTransport) (c *Client, err erro
 	c.senderRouteReady = make(chan struct{})
 	c.externalIPReady = make(chan struct{})
 	c.stop = newStop(context.Background())
+	err = c.initUpgrades()
 	return
 }
 
@@ -1833,6 +1843,7 @@ func (c *Client) receiverReconnectRelayAttempt(attempt int) error {
 // Send will send the specified file
 func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, totalNumberFolders int) (err error) {
 	defer func() { err = c.redactError(err) }()
+	defer c.closeMetrics()
 	go c.stop.done()
 	defer c.stop.Cancel()
 	defer c.closeTailcatBundle()
@@ -2068,6 +2079,7 @@ func (c *Client) discoverReceivePeers() (discoveries []peerdiscovery.Discovered)
 // Receive will receive a file
 func (c *Client) Receive() (err error) {
 	defer func() { err = c.redactError(err) }()
+	defer c.closeMetrics()
 	go c.stop.done()
 	defer c.stop.Cancel()
 	defer c.closeTailcatBundle()
