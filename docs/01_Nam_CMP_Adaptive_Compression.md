@@ -91,7 +91,7 @@ flowchart LR
   - **Phụ thuộc:** Độc lập trong `src/compress`.
   - **Tiêu chí hoàn thành (DoD):** Unit test `adaptive_test.go` pass trên 4 loại payload (pure text, JSON/log, `.zip`/`.mp4`, `/dev/urandom`), tỷ lệ bỏ nén trên dữ liệu random > 99%.
 
-- [ ] **`CMP-03`: Cài đặt `AdaptiveController` theo Nút thắt CPU vs Mạng** *(Ngày 2)*
+- [x] **`CMP-03`: Cài đặt `AdaptiveController` theo Nút thắt CPU vs Mạng** *(Ngày 2)*
   - **Mô tả kỹ thuật:** Trong `src/compress/controller.go`, duy trì EWMA của `t_compress` và `t_net_send`:
     - Nếu CPU nghẽn (`t_compress / (t_compress + t_net_send) > 0.45`): hạ level xuống `BestSpeed` / `HuffmanOnly`, hoặc chỉ nén chunk entropy rất thấp.
     - Nếu Mạng nghẽn (`ratio < 0.15`) và chunk nén tốt: nâng level lên `Default (6)` để giảm lượng byte đẩy lên mạng.
