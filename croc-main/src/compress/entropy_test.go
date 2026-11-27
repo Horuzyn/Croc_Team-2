@@ -3,6 +3,7 @@ package compress
 import (
 	"bytes"
 	"crypto/rand"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -49,18 +50,12 @@ func TestEntropyEstimate_Empty(t *testing.T) {
 }
 
 func TestEntropyEstimate_Compressed(t *testing.T) {
-	// Compressed payloads (e.g. .zip/.mp4) of non-trivial data exhibit high byte entropy (> 7.5).
-	// Use varied pseudo-text compressed with DefaultCompression (LZ77 + Huffman),
-	// since HuffmanOnly on a short repeating string remains periodic.
-	var rawBuf bytes.Buffer
-	for i := 0; rawBuf.Len() < 64*1024; i++ {
-		rawBuf.Write(fable)
-		rawBuf.WriteByte(byte(i))
-		rawBuf.WriteByte(byte(i >> 8))
-	}
-	compressed := CompressWithOption(rawBuf.Bytes(), 6)
+	// Compressed real source code exhibits high byte entropy (> 7.5).
+	raw, err := os.ReadFile("../croc/croc.go")
+	require.NoError(t, err)
+	compressed := CompressWithOption(raw, 6)
 	e := EntropyEstimate(compressed)
-	assert.Greater(t, e, 7.0, "compressed stream should have high entropy")
+	assert.Greater(t, e, 7.5, "compressed stream should have high entropy")
 }
 
 var entropyBenchSink float64
