@@ -81,7 +81,7 @@ flowchart LR
 
 ## 5. Danh sách Tasks Chi tiết của Nam (`CMP-01` → `CMP-06`)
 
-- [ ] **`CMP-01`: Thiết kế Entropy Sampler & Multi-level `flate` Pool** *(Ngày 1)*
+- [x] **`CMP-01`: Thiết kế Entropy Sampler & Multi-level `flate` Pool** *(Ngày 1)*
   - **Mô tả kỹ thuật:** Thiết kế hàm lấy mẫu Shannon entropy nhanh trên chunk 32 KiB (lấy mẫu stride 2–4 KiB để chi phí < 5 µs/chunk) và mở rộng [compress.go](../croc-main/src/compress/compress.go) với các `sync.Pool` tách biệt cho `flate.HuffmanOnly` (`-2`), `flate.BestSpeed` (`1`), `flate.DefaultCompression` (`6`).
   - **Phụ thuộc:** Nhận spec 1B `CodecHeader` và feature flag từ **Đức (`INT-01`)**.
   - **Tiêu chí hoàn thành (DoD):** Có tài liệu thiết kế ngắn và micro-benchmark xác nhận chi phí lấy mẫu entropy < 2% thời gian nén chunk.
