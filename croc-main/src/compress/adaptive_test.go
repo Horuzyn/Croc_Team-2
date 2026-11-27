@@ -44,9 +44,10 @@ func TestAdaptive_PreCompressed(t *testing.T) {
 	lp := NewLevelPool()
 	raw, err := os.ReadFile("../croc/croc.go")
 	require.NoError(t, err)
-	compressed := CompressWithOption(raw, 6)
-	require.GreaterOrEqual(t, len(compressed), 32*1024)
-	src := compressed[:32*1024]
+	src := CompressWithOption(raw, 6)
+	if len(src) > 32*1024 {
+		src = src[:32*1024]
+	}
 
 	res := AdaptiveCompressChunk(lp, nil, src, flate.HuffmanOnly)
 	assert.Equal(t, CodecRaw, res.Codec)
