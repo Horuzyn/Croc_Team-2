@@ -10,7 +10,7 @@ import (
 )
 
 func TestEntropyEstimate_PureText(t *testing.T) {
-	data := bytes.Repeat([]byte("the quick brown fox jumps over "), 1024)
+	data := bytes.Repeat([]byte("the quick brown fox jumps over "), 2048)
 	e := EntropyEstimate(data[:32*1024])
 	assert.Greater(t, e, 3.5, "text should have moderate entropy")
 	assert.Less(t, e, 5.5, "text should not be near random")
