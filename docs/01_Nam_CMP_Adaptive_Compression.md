@@ -86,7 +86,7 @@ flowchart LR
   - **Phụ thuộc:** Nhận spec 1B `CodecHeader` và feature flag từ **Đức (`INT-01`)**.
   - **Tiêu chí hoàn thành (DoD):** Có tài liệu thiết kế ngắn và micro-benchmark xác nhận chi phí lấy mẫu entropy < 2% thời gian nén chunk.
 
-- [ ] **`CMP-02`: Cài đặt Quyết định Bỏ nén theo từng Chunk** *(Ngày 2)*
+- [x] **`CMP-02`: Cài đặt Quyết định Bỏ nén theo từng Chunk** *(Ngày 2)*
   - **Mô tả kỹ thuật:** Viết `ShouldSkipCompression` / `AdaptiveCompressChunk` trong `src/compress/adaptive.go`: nếu entropy ước lượng `> 7.5 bits/byte` thì trả về ngay `CodecRaw (0x00)`; nếu thử nén mà `len(compressed) >= 0.96 * len(raw)` thì vẫn gửi `CodecRaw (0x00)` để Receiver không mất CPU giải nén vô ích.
   - **Phụ thuộc:** Độc lập trong `src/compress`.
   - **Tiêu chí hoàn thành (DoD):** Unit test `adaptive_test.go` pass trên 4 loại payload (pure text, JSON/log, `.zip`/`.mp4`, `/dev/urandom`), tỷ lệ bỏ nén trên dữ liệu random > 99%.
