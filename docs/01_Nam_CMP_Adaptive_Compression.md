@@ -81,17 +81,17 @@ flowchart LR
 
 ## 5. Danh sách Tasks Chi tiết của Nam (`CMP-01` → `CMP-06`)
 
-- [ ] **`CMP-01`: Thiết kế Entropy Sampler & Multi-level `flate` Pool** *(Ngày 1)*
+- [x] **`CMP-01`: Thiết kế Entropy Sampler & Multi-level `flate` Pool** *(Ngày 1)*
   - **Mô tả kỹ thuật:** Thiết kế hàm lấy mẫu Shannon entropy nhanh trên chunk 32 KiB (lấy mẫu stride 2–4 KiB để chi phí < 5 µs/chunk) và mở rộng [compress.go](../croc-main/src/compress/compress.go) với các `sync.Pool` tách biệt cho `flate.HuffmanOnly` (`-2`), `flate.BestSpeed` (`1`), `flate.DefaultCompression` (`6`).
   - **Phụ thuộc:** Nhận spec 1B `CodecHeader` và feature flag từ **Đức (`INT-01`)**.
   - **Tiêu chí hoàn thành (DoD):** Có tài liệu thiết kế ngắn và micro-benchmark xác nhận chi phí lấy mẫu entropy < 2% thời gian nén chunk.
 
-- [ ] **`CMP-02`: Cài đặt Quyết định Bỏ nén theo từng Chunk** *(Ngày 2)*
+- [x] **`CMP-02`: Cài đặt Quyết định Bỏ nén theo từng Chunk** *(Ngày 2)*
   - **Mô tả kỹ thuật:** Viết `ShouldSkipCompression` / `AdaptiveCompressChunk` trong `src/compress/adaptive.go`: nếu entropy ước lượng `> 7.5 bits/byte` thì trả về ngay `CodecRaw (0x00)`; nếu thử nén mà `len(compressed) >= 0.96 * len(raw)` thì vẫn gửi `CodecRaw (0x00)` để Receiver không mất CPU giải nén vô ích.
   - **Phụ thuộc:** Độc lập trong `src/compress`.
   - **Tiêu chí hoàn thành (DoD):** Unit test `adaptive_test.go` pass trên 4 loại payload (pure text, JSON/log, `.zip`/`.mp4`, `/dev/urandom`), tỷ lệ bỏ nén trên dữ liệu random > 99%.
 
-- [ ] **`CMP-03`: Cài đặt `AdaptiveController` theo Nút thắt CPU vs Mạng** *(Ngày 2)*
+- [x] **`CMP-03`: Cài đặt `AdaptiveController` theo Nút thắt CPU vs Mạng** *(Ngày 2)*
   - **Mô tả kỹ thuật:** Trong `src/compress/controller.go`, duy trì EWMA của `t_compress` và `t_net_send`:
     - Nếu CPU nghẽn (`t_compress / (t_compress + t_net_send) > 0.45`): hạ level xuống `BestSpeed` / `HuffmanOnly`, hoặc chỉ nén chunk entropy rất thấp.
     - Nếu Mạng nghẽn (`ratio < 0.15`) và chunk nén tốt: nâng level lên `Default (6)` để giảm lượng byte đẩy lên mạng.
