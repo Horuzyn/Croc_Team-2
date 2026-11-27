@@ -4,8 +4,11 @@ python -m unittest discover -s croc-main/scripts -p test_croc_bench.py -v
 """
 
 import hashlib
+import json
 import os
 from pathlib import Path
+import socket
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -59,6 +62,128 @@ class CorruptTest(unittest.TestCase):
         with self.assertRaises(bench.BenchError):
             bench_merkle_resume.corrupt_chunks(self.file, 1)
         self.assertEqual(self.file.read_bytes(), self.data)
+
+    def test_only_received_chunks_are_candidates(self):
+        # Giống file dở dang của croc: chunk chưa nhận là toàn byte 0.
+        data = bytearray(self.data)
+        data[2048:5120] = bytes(3072)  # chunk 2, 3, 4
+        data[10240:] = bytes(len(data) - 10240)  # chunk cuối (5 byte)
+        self.file.write_bytes(data)
+        present = bench_merkle_resume.present_chunks(self.file, chunk_size=1024)
+        self.assertEqual(present, [0, 1, 5, 6, 7, 8, 9])
+        changes = bench_merkle_resume.corrupt_chunks(
+            self.file, 7, chunk_size=1024, seed=3, candidates=present
+        )
+        self.assertEqual([change["chunk"] for change in changes], present)
+        with self.assertRaises(bench.BenchError):
+            bench_merkle_resume.corrupt_chunks(
+                self.file, 8, chunk_size=1024, candidates=present
+            )
+
+
+class ResumeHelpersTest(unittest.TestCase):
+    def test_request_rounds_from_debug_log(self):
+        log = (
+            b"[debug] croc.go:3448: sending recipient ready with 131 chunks\r\n"
+            b" 100% |####|\r[debug] croc.go:3448: sending recipient ready with 256 chunks\n"
+        )
+        self.assertEqual(bench_merkle_resume.requested_chunks(log), [131, 256])
+        self.assertEqual(bench_merkle_resume.requested_chunks(b"No files transferred."), [])
+
+    def test_merkle_totals(self):
+        events = [
+            {"event": "chunk_compress"},
+            {"event": "merkle_verify", "corrupt_chunks": 2, "retransmitted_bytes": 65536,
+             "saved_bytes": 100},
+            {"event": "merkle_verify", "corrupt_chunks": 1, "retransmitted_bytes": 32768,
+             "saved_bytes": 50},
+        ]  # fmt: skip
+        self.assertEqual(
+            bench_merkle_resume.merkle_totals(events),
+            {"mv_events": 2, "mv_corrupt_chunks": 3,
+             "mv_retransmitted_bytes": 98304, "mv_saved_bytes": 150},
+        )  # fmt: skip
+        self.assertEqual(
+            bench_merkle_resume.merkle_totals([])["mv_retransmitted_bytes"], None
+        )
+
+    def test_ss_command_targets_only_receiver_sockets(self):
+        self.assertEqual(
+            bench_merkle_resume.ss_kill_command([9009, 9010]),
+            ["ss", "-K", "-t", "(", "dst", "127.0.0.2:9009", "or",
+             "dst", "127.0.0.2:9010", ")"],
+        )  # fmt: skip
+
+    @unittest.skipIf(sys.platform.startswith("linux"), "chỉ kiểm tra OS không có ss -K")
+    def test_ss_cut_refused_outside_linux(self):
+        with self.assertRaises(bench.BenchError):
+            bench_merkle_resume.check_cut_method("ss")
+
+    def test_without_binaries_or_data_only_writes_status(self):
+        with tempfile.TemporaryDirectory() as work:
+            work = Path(work)
+            code = bench_merkle_resume.main(
+                ["--base", str(work / "khong-co"), "--data-dir", str(work),
+                 "--out", str(work / "out")]
+            )  # fmt: skip
+            self.assertEqual(code, 0)
+            status = json.loads((work / "out" / "status.json").read_text("utf-8"))
+            self.assertEqual(status["status"], "pending")
+            self.assertEqual(len(status["missing"]), 2)
+
+
+class ProxyTest(unittest.TestCase):
+    def setUp(self):
+        self.server = socket.socket()
+        self.server.bind((bench_merkle_resume.RELAY_HOST, 0))
+        self.server.listen()
+        self.addCleanup(self.server.close)
+        self.port = self.server.getsockname()[1]
+        self.proxy = bench_merkle_resume.CountingProxy([self.port])
+        self.addCleanup(self.proxy.close)
+
+    def connect(self):
+        client = socket.create_connection((bench_merkle_resume.PROXY_HOST, self.port), 5)
+        self.addCleanup(client.close)
+        upstream, _ = self.server.accept()
+        self.addCleanup(upstream.close)
+        upstream.settimeout(5)
+        return client, upstream
+
+    def recv_exactly(self, sock, size):
+        data = b""
+        while len(data) < size and (block := sock.recv(size - len(data))):
+            data += block
+        return data
+
+    def test_forwards_and_counts_each_direction(self):
+        client, upstream = self.connect()
+        payload = os.urandom(300_000)
+        upstream.sendall(payload)
+        self.assertEqual(self.recv_exactly(client, len(payload)), payload)
+        client.sendall(b"ack")
+        self.assertEqual(self.recv_exactly(upstream, 3), b"ack")
+        self.assertEqual(self.proxy.counters(), (len(payload), 3))
+        self.proxy.reset_counters()
+        self.assertEqual(self.proxy.counters(), (0, 0))
+
+    def assert_dropped(self, sock):
+        # Đầu bị cắt thấy RST (lỗi) hoặc EOF, tùy OS; không được treo hay nhận dữ liệu.
+        sock.settimeout(5)
+        try:
+            self.assertEqual(sock.recv(1), b"")
+        except (ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def test_cut_drops_connections_and_blocks_new_ones(self):
+        client, upstream = self.connect()
+        self.proxy.cut()
+        self.assert_dropped(client)
+        self.assert_dropped(upstream)
+        late = socket.create_connection((bench_merkle_resume.PROXY_HOST, self.port), 5)
+        self.addCleanup(late.close)
+        self.assert_dropped(late)
+        self.assertEqual(self.proxy.active(), 0)
 
 
 class ProbeTest(unittest.TestCase):
@@ -166,6 +291,31 @@ class TransferTest(unittest.TestCase):
         with mock.patch.object(bench.Child, "wait", wait):
             with self.assertRaises(KeyboardInterrupt):
                 self.transfer()
+        self.assert_cleaned()
+
+    def test_cut_corrupt_and_resume(self):
+        # croc-base chỉ xin lại chunk thiếu; chunk bị lật byte làm hash cả file
+        # sai nên nó xin lại toàn bộ file ở vòng thứ hai.
+        self.source.write_bytes(os.urandom(2 << 20))
+        result = bench_merkle_resume.run_resume_trial(
+            self.root / "run",
+            binary=bench.DEFAULT_BASE,
+            relay_binary=bench.DEFAULT_BASE,
+            source=self.source,
+            expected_sha256=hashlib.sha256(self.source.read_bytes()).hexdigest(),
+            cut="reset",
+            cut_at=0.5,
+            corrupt=1,
+            seed=1,
+            rate=1 << 20,
+            timeout=60,
+        )
+        self.assertEqual(result["status"], "ok", result.get("error"))
+        total = (2 << 20) // bench_merkle_resume.CHUNK_SIZE
+        self.assertEqual(result["present_chunks"] + result["missing_chunks"], total)
+        self.assertEqual(result["requested_chunks"], result["missing_chunks"])
+        self.assertEqual(result["request_rounds"], 2)
+        self.assertGreater(result["resume_wire_bytes"], 2 << 20)
         self.assert_cleaned()
 
 
