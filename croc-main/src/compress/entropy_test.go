@@ -49,9 +49,16 @@ func TestEntropyEstimate_Empty(t *testing.T) {
 }
 
 func TestEntropyEstimate_Compressed(t *testing.T) {
-	// Compressed payloads (e.g. .zip/.mp4) exhibit high byte entropy (> 7.5).
-	raw := bytes.Repeat([]byte("highly-compressible-structured-payload-"), 1024)
-	compressed := Compress(raw[:32*1024])
+	// Compressed payloads (e.g. .zip/.mp4) of non-trivial data exhibit high byte entropy (> 7.5).
+	// Use varied pseudo-text compressed with DefaultCompression (LZ77 + Huffman),
+	// since HuffmanOnly on a short repeating string remains periodic.
+	var rawBuf bytes.Buffer
+	for i := 0; rawBuf.Len() < 64*1024; i++ {
+		rawBuf.Write(fable)
+		rawBuf.WriteByte(byte(i))
+		rawBuf.WriteByte(byte(i >> 8))
+	}
+	compressed := CompressWithOption(rawBuf.Bytes(), 6)
 	e := EntropyEstimate(compressed)
 	assert.Greater(t, e, 7.0, "compressed stream should have high entropy")
 }
