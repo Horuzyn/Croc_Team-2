@@ -80,27 +80,27 @@ flowchart LR
 
 ## 5. Danh sách Tasks Chi tiết của Long (`MRK-01` → `MRK-06`)
 
-- [ ] **`MRK-01`: Thiết kế Cây Merkle & Giao thức Kiểm chứng Resume** *(Ngày 1)*
+- [x] **`MRK-01`: Thiết kế Cây Merkle & Giao thức Kiểm chứng Resume** *(Ngày 1)*
   - **Mô tả kỹ thuật:** Chốt kích thước lá **32 KiB** khớp 1-1 với wire chunk (file 800 MB có ~25,600 lá × 32B ≈ 800 KiB RAM). Quy chuẩn domain separation: lá `SHA256(0x00 || chunk)`, nút cha `SHA256(0x01 || left || right)`. Thiết kế payload `MerkleManifest` và state machine cho `TypeChunkRepairRequest`/`Ack`.
   - **Phụ thuộc:** Nhận message types từ **Đức (`INT-01`)**; khớp định dạng `[]int64` cho `ReenqueueRanges` với **Sơn (`SCH-01`)**.
-  - **Tiêu chí hoàn thành (DoD):** Tài liệu thiết kế nêu rõ xử lý file 0 byte, file < 32 KiB, file không chia hết cho 32 KiB và giới hạn size control message.
+  - **Tiêu chí hoàn thành (DoD):** Tài liệu thiết kế ([MRK-01_Merkle_Resume_Design.md](../croc-main/src/docs/MRK-01_Merkle_Resume_Design.md)) nêu rõ xử lý file 0 byte, file < 32 KiB, file không chia hết cho 32 KiB và giới hạn size control message.
 
-- [ ] **`MRK-02`: Xây dựng Package `src/merkle`** *(Ngày 2)*
+- [x] **`MRK-02`: Xây dựng Package `src/merkle`** *(Ngày 2)*
   - **Mô tả kỹ thuật:** Triển khai trong `src/merkle/merkle.go`: `BuildTreeFromFile(path, chunkSize)`, `Root()`, `LeafHashes()`, `VerifyChunk(index, data)` và `DiffLeaves(localLeaves, remoteLeaves) -> []int64` (trả về định dạng `ChunkRanges` tương thích `croc`).
   - **Phụ thuộc:** Độc lập hoàn toàn (dùng `crypto/sha256` chuẩn Go).
   - **Tiêu chí hoàn thành (DoD):** Unit test `merkle_test.go` pass mọi edge cases và phát hiện chính xác 1 bit bị lật ở bất kỳ chunk nào.
 
-- [ ] **`MRK-03`: Nâng cấp Bộ quét Resume Kiểm chứng trên Đĩa (`VerifiedMissingChunks`)** *(Ngày 2)*
+- [x] **`MRK-03`: Nâng cấp Bộ quét Resume Kiểm chứng trên Đĩa (`VerifiedMissingChunks`)** *(Ngày 2)*
   - **Mô tả kỹ thuật:** Trong `src/merkle/resume.go`, dùng worker pool (`runtime.NumCPU()`) đọc và băm song song các chunk hiện có trên file tạm, đối chiếu với `remoteLeaves` để trả về `missing ∪ corrupted` dưới dạng `[]int64`.
   - **Phụ thuộc:** Dựa trên `src/merkle/merkle.go`.
   - **Tiêu chí hoàn thành (DoD):** Unit test `resume_test.go` tạo file dở dang 50% và ghi đè rác vào 3 chunk bất kỳ → phát hiện chính xác 3 chunk hỏng + 50% phần thiếu.
 
-- [ ] **`MRK-04`: Tích hợp Merkle vào Handshake, Manifest & Inline Verification** *(Ngày 3)*
+- [x] **`MRK-04`: Tích hợp Merkle vào Handshake, Manifest & Inline Verification** *(Ngày 3)*
   - **Mô tả kỹ thuật:** Quảng bá `merkle-chunk-resume-v1` trong `pakeFeatures()`. Gắn `MerkleRoot` vào `FileInfo` ([file_manifest.go](../croc-main/src/croc/file_manifest.go)), gửi/nhận `TypeMerkleManifest`. Tại `receiveData` (sau bước giải nén của **Nam**), gọi `VerifyChunk(idx, plaintext)`; nếu sai → ghi vào danh sách `corruptChunks`.
   - **Phụ thuộc:** **Đức (`INT-01`)**; móc nối ngay sau bước giải nén của **Nam (`CMP-04`)**.
   - **Tiêu chí hoàn thành (DoD):** Peer mới trao đổi được `MerkleManifest`; peer cũ tự động fallback về cơ chế hash cuối file truyền thống.
 
-- [ ] **`MRK-05`: Cài đặt Luồng Truyền lại Chọn lọc (`TypeChunkRepairRequest`/`Ack`)** *(Ngày 4)*
+- [x] **`MRK-05`: Cài đặt Luồng Truyền lại Chọn lọc (`TypeChunkRepairRequest`/`Ack`)** *(Ngày 4)*
   - **Mô tả kỹ thuật:** Khi kết thúc lượt nhận chính hoặc ngay khi Resume phát hiện chunk hỏng, Receiver gửi `TypeChunkRepairRequest` chứa các range lỗi; Sender xử lý trong `processMessage`, gọi `SCH.ReenqueueRanges(ranges)` của **Sơn** và phản hồi `TypeChunkRepairAck`. Giới hạn tối đa 3 vòng retry để tránh vòng lặp vô hạn khi lỗi ổ đĩa vật lý; xuất telemetry `merkle_verify`.
   - **Phụ thuộc:** API `ReenqueueRanges` của **Sơn (`SCH-04`)**.
   - **Tiêu chí hoàn thành (DoD):** E2E test `merkle_resume_test.go`: truyền file 10 MB, ngắt giữa chừng, làm hỏng 2 chunk (64 KiB) trên đĩa, resume → chỉ truyền lại phần thiếu + 64 KiB hỏng, SHA-256 cuối khớp 100%.
