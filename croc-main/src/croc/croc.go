@@ -268,6 +268,8 @@ type Client struct {
 	reconnectVersion           int
 	peerReconnectVersion       int
 	peerPerFileCompression     bool
+	peerMerkleChunkResume      bool
+	merkle                     merkleTransferState
 	metrics                    telemetry.Sink // never nil after New
 	peerInlineMetadata         bool
 	peerProgressiveHash        bool
@@ -360,6 +362,7 @@ type FileInfo struct {
 	TempFile     bool        `json:"tf,omitempty"`
 	IsIgnored    bool        `json:"ig,omitempty"`
 	Prepared     bool        `json:"p,omitempty"`
+	MerkleRoot   []byte      `json:"mr,omitempty"`
 
 	// declined is set on the receiver when the user refuses to overwrite
 	// or resume the file, so nothing was written for it.
@@ -790,6 +793,8 @@ func (c *Client) resetForReconnectAttempt(attempt int) error {
 	c.pakeKeys = pakekey.Keys{}
 	c.pakeConfirmationPending = false
 	c.peerPerFileCompression = false
+	c.peerMerkleChunkResume = false
+	c.resetMerkleState()
 	c.peerInlineMetadata = false
 	c.peerProgressiveHash = false
 	c.peerChunkedFileInfo = false
@@ -2848,6 +2853,7 @@ func (c *Client) processMessagePake(m message.Message, attempt *transferAttemptS
 	c.peerChunkedFileInfo = supportsFeature(m.Features, chunkedFileInfoFeature)
 	c.peerStagedTransport = supportsFeature(m.Features, stagedTransportFeature)
 	c.peerImplicitTailcatReady = supportsFeature(m.Features, implicitTailcatReadyFeature)
+	c.peerMerkleChunkResume = supportsFeature(m.Features, message.FeatureMerkleChunkResumeV1)
 	c.bundles.peerHandshake = supportsFeature(m.Features, bundle.Feature)
 	c.bundles.peerNative = c.bundles.peerHandshake && supportsFeature(m.Features, bundle.NativeFeature)
 	if c.pakeConfirmationPending || c.Key != nil {
@@ -3202,6 +3208,12 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 		err = c.processExactHashRequest(m)
 	case message.TypeExactHashResult:
 		err = c.processExactHashResult(m)
+	case message.TypeMerkleManifest:
+		err = c.processMessageMerkleManifest(m)
+	case message.TypeChunkRepairRequest:
+		err = c.processMessageChunkRepairRequest(m, attempt)
+	case message.TypeChunkRepairAck:
+		err = c.processMessageChunkRepairAck(m)
 	case message.TypeRelayStandby:
 		err = c.processRelayStandby(attempt)
 	case message.TypeRelayRamp:
@@ -3295,6 +3307,9 @@ func (c *Client) updateIfSenderChannelSecured() (err error) {
 		if err := c.finalizeHashNegotiation(); err != nil {
 			return err
 		}
+		if err := c.sendMerkleManifestsForTransfer(); err != nil {
+			return err
+		}
 		machID, _ := machineid.ID()
 		nextReconnectRoom := ""
 		externalIP := ""
@@ -3369,17 +3384,25 @@ func (c *Client) recipientInitializeFile() (err error) {
 		os.O_RDWR, 0o666)
 	var truncate bool // default false
 	c.CurrentFileChunkRanges = []int64{}
+	c.resetMerkleFileState()
 	if errOpen == nil {
 		stat, _ := c.CurrentFile.Stat()
 		truncate = stat.Size() != c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
 		if !truncate {
-			// recipient requests the file and chunks (if empty, then should receive all chunks)
-			// TODO: determine the missing chunks
-			c.CurrentFileChunkRanges = utils.MissingChunksFile(
+			if ranges, ok := c.verifiedResumeRanges(
 				c.CurrentFile,
+				c.FilesToTransferCurrentNum,
 				c.FilesToTransfer[c.FilesToTransferCurrentNum].Size,
-				models.TCP_BUFFER_SIZE/2,
-			)
+			); ok {
+				c.CurrentFileChunkRanges = ranges
+			} else {
+				// Fallback to legacy zero-chunk scan when peer lacks merkle-chunk-resume-v1.
+				c.CurrentFileChunkRanges = utils.MissingChunksFile(
+					c.CurrentFile,
+					c.FilesToTransfer[c.FilesToTransferCurrentNum].Size,
+					models.TCP_BUFFER_SIZE/2,
+				)
+			}
 		}
 	} else {
 		c.CurrentFile, errOpen = root.OpenFile(pathToFile, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
@@ -3859,6 +3882,10 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 		receiveFile := c.CurrentFile
 		c.receiveMutex.Unlock()
 
+		// MRK-04: verify plaintext chunk against remote Merkle tree before writing;
+		// CMP-04 will pass the decompressed plaintext slice here.
+		c.verifyIncomingChunk(positionInt64, data[8:])
+
 		// os.File supports concurrent WriteAt calls. Keep disk I/O outside the
 		// state lock so all relay connections can write in parallel.
 		_, err = receiveFile.WriteAt(data[8:], positionInt64)
@@ -3876,10 +3903,38 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 		c.TotalChunksTransferred++
 		finished := c.TotalChunksTransferred == c.CurrentFileChunkCount ||
 			c.TotalSent == c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
+
+		var repairRanges []int64
+		var repairRound int
+		var repairErr error
 		if finished {
-			c.CurrentFileIsClosed = true
+			repairRanges, repairRound, repairErr = c.finishOrRequestMerkleRepair(fileSize)
+			if repairErr != nil {
+				c.CurrentFileIsClosed = true
+			} else if len(repairRanges) > 0 {
+				// Keep the file open and reset pass counters for selective repair.
+				c.TotalChunksTransferred = 0
+				c.CurrentFileChunkRanges = repairRanges
+				c.CurrentFileChunkCount = utils.ChunkRangesCount(repairRanges, fileSize, models.TCP_BUFFER_SIZE/2)
+				finished = false
+			} else {
+				c.CurrentFileIsClosed = true
+			}
 		}
 		c.receiveMutex.Unlock()
+
+		if repairErr != nil {
+			_ = receiveFile.Close()
+			attempt.report(repairErr)
+			return
+		}
+		if len(repairRanges) > 0 {
+			if err = c.sendChunkRepairRequest(c.FilesToTransferCurrentNum, repairRound, repairRanges); err != nil {
+				attempt.report(err)
+				return
+			}
+			continue
+		}
 
 		c.addProgress(int64(len(data[8:])))
 		if finished {
