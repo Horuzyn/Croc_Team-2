@@ -57,6 +57,20 @@ const (
 	TypeRelayRamp        Type = "relay-ramp"
 	TypeSSHAuthorize     Type = "ssh-authorize"
 	TypeSSHOffer         Type = "ssh-offer"
+
+	// Merkle resume control messages. Send them only to a peer that
+	// advertised FeatureMerkleChunkResumeV1.
+	TypeMerkleManifest     Type = "merkle-manifest"
+	TypeChunkRepairRequest Type = "chunk-repair-req"
+	TypeChunkRepairAck     Type = "chunk-repair-ack"
+)
+
+// PAKE feature names of the Croc_Team-2 upgrades. A client must advertise one
+// only once it implements the matching behaviour.
+const (
+	FeatureAdaptiveChunkCompressV1 = "adaptive-chunk-compress-v1"
+	FeatureDynamicChunkSchedV1     = "dynamic-chunk-sched-v1"
+	FeatureMerkleChunkResumeV1     = "merkle-chunk-resume-v1"
 )
 
 // FeatureSSHRendezvous marks the unencrypted PAKE negotiation for a shared
