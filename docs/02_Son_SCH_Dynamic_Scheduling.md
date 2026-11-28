@@ -95,7 +95,7 @@ flowchart LR
   - **Phụ thuộc:** Độc lập với mạng thực qua mock worker tests.
   - **Tiêu chí hoàn thành (DoD):** Unit test `chunk_scheduler_test.go` với 4 worker (1 worker chậm 10×): tổng thời gian giảm rõ rệt, mọi chunk hoàn tất đúng, không deadlock hay livelock.
 
-- [ ] **`SCH-04`: Tích hợp Scheduler vào `sendData` & Mở API `ReenqueueRanges`** *(Ngày 3)*
+- [x] **`SCH-04`: Tích hợp Scheduler vào `sendData` & Mở API `ReenqueueRanges`** *(Ngày 3)*
   - **Mô tả kỹ thuật:** Gắn `adaptiveChunkQueue` vào `startSenderUnit` / `sendData` trong [croc.go](../croc-main/src/croc/croc.go#L3938-L4035) khi dùng `--sched dynamic`; chuyển `netSendDuration` cho **Nam (`CMP-03`)**; triển khai `ReenqueueRanges(ranges []int64)` thread-safe cho **Long (`MRK-05`)**.
   - **Phụ thuộc:** Phối hợp **Nam (`CMP-04`)** tại `sendData`; mở đường cho **Long (`MRK-05`)**.
   - **Tiêu chí hoàn thành (DoD):** Truyền file 100–800 MB qua 4–8 luồng TCP ổn định; cờ `--sched static` chạy lại đúng hành vi cũ để benchmark A/B.

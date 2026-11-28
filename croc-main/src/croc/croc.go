@@ -268,7 +268,14 @@ type Client struct {
 	reconnectVersion           int
 	peerReconnectVersion       int
 	peerPerFileCompression     bool
+	peerDynamicChunkSched      bool
 	metrics                    telemetry.Sink // never nil after New
+	debugThrottleWorkerID      int
+	debugWorkerLimiter         *rate.Limiter
+	lastNetSendNs              atomic.Int64
+	netSendObserverMu          sync.RWMutex
+	netSendObserver            func(time.Duration)
+	receivedChunks             pagedChunkBitset
 	peerInlineMetadata         bool
 	peerProgressiveHash        bool
 	peerChunkedFileInfo        bool
@@ -790,6 +797,7 @@ func (c *Client) resetForReconnectAttempt(attempt int) error {
 	c.pakeKeys = pakekey.Keys{}
 	c.pakeConfirmationPending = false
 	c.peerPerFileCompression = false
+	c.peerDynamicChunkSched = false
 	c.peerInlineMetadata = false
 	c.peerProgressiveHash = false
 	c.peerChunkedFileInfo = false
@@ -1844,6 +1852,7 @@ func (c *Client) receiverReconnectRelayAttempt(attempt int) error {
 func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, totalNumberFolders int) (err error) {
 	defer func() { err = c.redactError(err) }()
 	defer c.closeMetrics()
+	defer c.joinSenderUnit()
 	go c.stop.done()
 	defer c.stop.Cancel()
 	defer c.closeTailcatBundle()
@@ -2848,6 +2857,7 @@ func (c *Client) processMessagePake(m message.Message, attempt *transferAttemptS
 	c.peerChunkedFileInfo = supportsFeature(m.Features, chunkedFileInfoFeature)
 	c.peerStagedTransport = supportsFeature(m.Features, stagedTransportFeature)
 	c.peerImplicitTailcatReady = supportsFeature(m.Features, implicitTailcatReadyFeature)
+	c.peerDynamicChunkSched = supportsFeature(m.Features, message.FeatureDynamicChunkSchedV1)
 	c.bundles.peerHandshake = supportsFeature(m.Features, bundle.Feature)
 	c.bundles.peerNative = c.bundles.peerHandshake && supportsFeature(m.Features, bundle.NativeFeature)
 	if c.pakeConfirmationPending || c.Key != nil {
@@ -3255,6 +3265,7 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 			}
 		}
 	case message.TypeCloseSender:
+		c.joinSenderUnit()
 		c.finishProgress()
 		log.Debug("close-sender received...")
 		c.updateLifecycle(func(state *transferLifecycle) {
@@ -3369,6 +3380,7 @@ func (c *Client) recipientInitializeFile() (err error) {
 		os.O_RDWR, 0o666)
 	var truncate bool // default false
 	c.CurrentFileChunkRanges = []int64{}
+	c.receivedChunks = newPagedChunkBitset(models.TCP_BUFFER_SIZE / 2)
 	if errOpen == nil {
 		stat, _ := c.CurrentFile.Stat()
 		truncate = stat.Size() != c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
@@ -3835,6 +3847,9 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 		c.receiveMutex.Lock()
 		if c.CurrentFileIsClosed || c.CurrentFile == nil {
 			c.receiveMutex.Unlock()
+			if c.dynamicSchedReceiveActive() && c.ctxErr() == nil {
+				continue
+			}
 			log.Tracef("was closed %d", i)
 			return
 		}
@@ -3870,10 +3885,19 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 		c.receiveMutex.Lock()
 		if c.CurrentFileIsClosed || c.CurrentFile != receiveFile {
 			c.receiveMutex.Unlock()
+			if c.dynamicSchedReceiveActive() && c.ctxErr() == nil {
+				continue
+			}
 			return
 		}
-		c.TotalSent += int64(len(data[8:]))
-		c.TotalChunksTransferred++
+		firstArrival := true
+		if c.dynamicSchedReceiveActive() {
+			firstArrival = c.receivedChunks.Set(positionInt64)
+		}
+		if firstArrival {
+			c.TotalSent += int64(len(data[8:]))
+			c.TotalChunksTransferred++
+		}
 		finished := c.TotalChunksTransferred == c.CurrentFileChunkCount ||
 			c.TotalSent == c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
 		if finished {
@@ -3881,7 +3905,9 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 		}
 		c.receiveMutex.Unlock()
 
-		c.addProgress(int64(len(data[8:])))
+		if firstArrival {
+			c.addProgress(int64(len(data[8:])))
+		}
 		if finished {
 			log.Debug("finished receiving!")
 			if err = receiveFile.Close(); err != nil {
@@ -3967,14 +3993,16 @@ func (c *Client) sendData(i int, dataConn *comm.Comm, fread *os.File, queue *req
 		if attempt.ctx != nil && attempt.ctx.Err() != nil {
 			return
 		}
-		readingPos, ok := queue.claim()
+		ticket, ok := queue.acquireTicket(i)
 		if !ok {
 			return
 		}
+		readingPos := ticket.Offset
 
 		n, errRead := fread.ReadAt(payload[8:], readingPos)
 		if n == 0 {
-			if attempt.ctx != nil && attempt.ctx.Err() != nil {
+			queue.releaseTicket(i, ticket)
+			if queue.isUnitFinished() || (attempt.ctx != nil && attempt.ctx.Err() != nil) {
 				return
 			}
 			if errRead == nil {
@@ -3992,10 +4020,12 @@ func (c *Client) sendData(i int, dataConn *comm.Comm, fread *os.File, queue *req
 			case <-c.stop.ctx.Done():
 				r.Cancel()
 				timer.Stop()
+				queue.releaseTicket(i, ticket)
 				return
 			case <-attempt.contextDone():
 				r.Cancel()
 				timer.Stop()
+				queue.releaseTicket(i, ticket)
 				return
 			}
 		}
@@ -4011,25 +4041,47 @@ func (c *Client) sendData(i int, dataConn *comm.Comm, fread *os.File, queue *req
 				dataToSend, err = crypt.EncryptAEADTo(encryptedBuffer, plain, c.dataAEAD)
 			}
 			if err != nil {
+				queue.releaseTicket(i, ticket)
 				attempt.report(err)
 				return
 			}
 			encryptedBuffer = dataToSend
-			if err = dataConn.Send(dataToSend); err != nil {
-				if c.ctxErr() == nil {
+
+			if queue.tracker != nil {
+				queue.tracker.MarkSendStart(i, n)
+			}
+			sendStart := time.Now()
+			if !c.waitDebugWorkerThrottle(queue.unitCtx, attempt, i, n) {
+				if queue.tracker != nil {
+					queue.tracker.MarkSendFinish(i)
+				}
+				queue.releaseTicket(i, ticket)
+				return
+			}
+			err = dataConn.Send(dataToSend)
+			netSendDuration := time.Since(sendStart)
+			if queue.tracker != nil {
+				queue.tracker.MarkSendFinish(i)
+			}
+			if err != nil {
+				queue.releaseTicket(i, ticket)
+				if !queue.isUnitFinished() && c.ctxErr() == nil {
 					attempt.report(transferDisconnectError{err: err})
 				}
 				return
 			}
-			if queue.progress != nil {
-				queue.progress(readingPos, n)
-			} else {
-				c.addProgress(int64(n))
+			c.recordNetSendDuration(netSendDuration)
+
+			if queue.completeTicket(i, ticket, n, netSendDuration) {
+				if queue.progress != nil {
+					queue.progress(readingPos, n)
+				} else {
+					c.addProgress(int64(n))
+				}
+				c.mutex.Lock()
+				c.TotalSent += int64(n)
+				c.mutex.Unlock()
 			}
-			c.mutex.Lock()
-			c.TotalSent += int64(n)
-			c.mutex.Unlock()
-			queue.complete()
 		}
 
 		if errRead != nil {
@@ -4037,6 +4089,9 @@ func (c *Client) sendData(i int, dataConn *comm.Comm, fread *os.File, queue *req
 				return
 			}
 			if errRead == io.EOF {
+				if queue.scheduler != nil {
+					continue
+				}
 				break
 			}
 			attempt.report(errRead)
