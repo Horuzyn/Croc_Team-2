@@ -13,8 +13,10 @@ import tempfile
 import unittest
 from unittest import mock
 
+import bench_dynamic_sched
 import bench_merkle_resume
 import croc_bench as bench
+import plot_results
 
 
 def row(status, speed="", dataset="text", profile="base"):
@@ -317,6 +319,125 @@ class TransferTest(unittest.TestCase):
         self.assertEqual(result["request_rounds"], 2)
         self.assertGreater(result["resume_wire_bytes"], 2 << 20)
         self.assert_cleaned()
+
+
+def sched_row(profile, rate, seconds, stolen="", status="ok"):
+    return {
+        "suite": "dynamic-sched", "profile": profile, "rate": rate, "dataset": "random",
+        "file": "f", "bytes": "1048576", "status": status, "seconds": seconds,
+        "mib_per_s": str(1 / float(seconds)), "stolen_chunks": stolen,
+    }  # fmt: skip
+
+
+class DynamicSchedTest(unittest.TestCase):
+    def test_rate_uses_croc_syntax(self):
+        self.assertEqual(bench_dynamic_sched.parse_rate("512k"), 512 * 1024)
+        self.assertEqual(bench_dynamic_sched.parse_rate("2M"), 2 << 20)
+        self.assertEqual(bench_dynamic_sched.parse_rate("1000"), 1000)
+        for bad in ("", "k", "0k", "-5k", "1.5m", "5x"):
+            with self.assertRaises(ValueError, msg=bad):
+                bench_dynamic_sched.parse_rate(bad)
+
+    def test_stream_stats_and_totals(self):
+        with tempfile.TemporaryDirectory() as work:
+            path = Path(work) / "m.jsonl"
+            self.assertEqual(bench_dynamic_sched.read_stream_stats(path), [])
+            records = [
+                {"ts": "2026-11-28T15:00:00.000000Z", "event": "stream_stat", "worker_id": 0,
+                 "local_port": 1, "throughput_bps": 5.0, "inflight": 1, "stolen_chunks": 0},
+                {"ts": "2026-11-28T15:00:00.250000Z", "event": "stream_stat", "worker_id": 1,
+                 "local_port": 2, "throughput_bps": 9.0, "inflight": 0, "stolen_chunks": 3},
+                {"ts": "2026-11-28T15:00:00.500000Z", "event": "chunk_compress"},
+                {"ts": "2026-11-28T15:00:00.500000Z", "event": "stream_stat", "worker_id": 1,
+                 "local_port": 2, "throughput_bps": 9.0, "inflight": 0, "stolen_chunks": 2},
+            ]  # fmt: skip
+            path.write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
+            events = bench_dynamic_sched.read_stream_stats(path)
+            path.write_text("{hỏng\n", encoding="utf-8")
+            with self.assertRaises(bench.BenchError):
+                bench_dynamic_sched.read_stream_stats(path)
+        self.assertEqual(len(events), 3)
+        # Bộ đếm cộng dồn: lấy giá trị lớn nhất của từng worker.
+        self.assertEqual(
+            bench_dynamic_sched.stream_totals(events),
+            {"workers": 2, "stolen_chunks": 3, "stream_samples": 3},
+        )
+        self.assertIsNone(bench_dynamic_sched.stream_totals([])["stolen_chunks"])
+        rows = bench_dynamic_sched.stream_rows(events, profile="dynamic", rate="32k", trial=1)
+        self.assertEqual([r["t_seconds"] for r in rows], [0, 0.25, 0.5])
+        self.assertEqual(rows[1]["worker_id"], 1)
+
+    def test_throttle_only_on_upgraded_sender(self):
+        base = {"name": "base", "global": [], "metrics": False}
+        dynamic = {"name": "dynamic", "global": ["--sched", "dynamic"], "metrics": True}
+        cases = bench_dynamic_sched.plan_cases([base, dynamic], ["512k", "32k"], "flag")
+        self.assertEqual(
+            [(p["name"], rate) for p, rate in cases],
+            [("base", "none"), ("dynamic", "512k"), ("dynamic", "32k")],
+        )
+        self.assertEqual(
+            bench_dynamic_sched.profile_args(dynamic, "32k", "flag", "m.jsonl"),
+            (["--sched", "dynamic"],
+             ["--metrics-out", "m.jsonl", "--debug-throttle-worker", "0:32k"]),
+        )  # fmt: skip
+        self.assertEqual(bench_dynamic_sched.profile_args(base, "none", "flag", "m"), ([], []))
+        # Với tc thì cổng bị bóp ở mạng, không cần cờ.
+        self.assertEqual(
+            bench_dynamic_sched.profile_args(dynamic, "32k", "tc", "m")[1], ["--metrics-out", "m"]
+        )
+        self.assertEqual(len(bench_dynamic_sched.plan_cases([base], ["1k", "2k"], "tc")), 2)
+
+    def test_tc_commands_shape_only_one_port(self):
+        setup, cleanup = bench_dynamic_sched.tc_commands(9010, 32 * 1024)
+        self.assertIn("262144bit", setup[1])
+        self.assertEqual(setup[2][setup[2].index("dport") + 1], "9010")
+        self.assertEqual(cleanup, ["tc", "qdisc", "del", "dev", "lo", "root"])
+
+    def test_summary_compares_with_static(self):
+        rows = [
+            sched_row("base", "none", "1.0"),
+            sched_row("static", "32k", "2.0", "0"), sched_row("static", "32k", "2.2", "0"),
+            sched_row("dynamic", "32k", "1.0", "6"), sched_row("dynamic", "32k", "1.2", "4"),
+            sched_row("dynamic", "32k", "9.9", "99", status="failed"),
+        ]  # fmt: skip
+        summary = {(r["rate"], r["profile"]): r for r in bench_dynamic_sched.summarize(rows)}
+        self.assertIsNone(summary["none", "base"]["vs_static_pct"])
+        self.assertIsNone(summary["32k", "static"]["vs_static_pct"])
+        dynamic = summary["32k", "dynamic"]
+        self.assertEqual((dynamic["trials_ok"], dynamic["trials_total"]), (2, 3))
+        self.assertEqual(dynamic["median_stolen_chunks"], 5)
+        self.assertAlmostEqual(dynamic["vs_static_pct"], 47.619, places=2)
+        table = bench_dynamic_sched.markdown_table(list(summary.values()))
+        self.assertIn("| không bóp | base |", table)
+        self.assertIn("+47.6%", table)
+
+    def test_without_dataset_reports_pending(self):
+        with tempfile.TemporaryDirectory() as work:
+            out = Path(work) / "out"
+            code = bench_dynamic_sched.main(
+                ["--base", str(Path(work) / "none"), "--data-dir", work, "--out", str(out)]
+            )
+            status = json.loads((out / "status.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0)
+        self.assertEqual(status["status"], "pending")
+        self.assertEqual(len(status["missing"]), 2)
+
+
+class PlotTest(unittest.TestCase):
+    def test_finds_each_suite_by_folder(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            for name, suite in [("cmp", "adaptive-compress"), ("sch", "dynamic-sched"),
+                                ("mrk", "merkle-resume"), ("khac", "khac")]:  # fmt: skip
+                (root / name).mkdir()
+                (root / name / "trials.csv").write_text(
+                    f"suite,profile\n{suite},base\n", encoding="utf-8"
+                )
+            jobs = plot_results.find_jobs(root, root / "plots")
+        self.assertEqual(
+            [(suite, name) for suite, _, name, _ in jobs],
+            [("adaptive-compress", "cmp"), ("merkle-resume", "mrk"), ("dynamic-sched", "sch")],
+        )
 
 
 if __name__ == "__main__":

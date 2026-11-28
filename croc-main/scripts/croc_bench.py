@@ -297,14 +297,18 @@ def run_transfer(
     source,
     expected_sha256,
     global_args=(),
+    sender_global_args=(),
     send_args=(),
     receive_args=(),
     timeout=600,
     ready_timeout=120,
+    ports=None,
 ):
     """Truyền source một lần. Trả về dict; status là "ok" hoặc "failed".
 
     seconds tính từ lúc khởi chạy receiver đến lúc receiver thoát, gồm cả bắt tay.
+    sender_global_args là cờ chung chỉ cho sender (đặt trước lệnh send).
+    ports: 5 cổng relay chọn sẵn (cổng đầu để bắt tay, các cổng sau cho dữ liệu).
     KeyboardInterrupt được ném tiếp sau khi đã dừng hết tiến trình.
     """
     run_dir = Path(run_dir).resolve()
@@ -317,7 +321,7 @@ def run_transfer(
     result = {"status": "failed", "sha256_ok": False, "cpu_method": CPU_METHOD}
     try:
         _link_or_copy(source, staged)
-        ports = free_ports(5)
+        ports = list(ports) if ports else free_ports(5)
         secret = transfer_secret()
         common = [
             Path(binary).resolve(), "--relay", f"127.0.0.1:{ports[0]}", "--relay6", "",
@@ -347,7 +351,8 @@ def run_transfer(
             sender = group.spawn(
                 "sender",
                 [
-                    *common, "send", "--no-local", "--transport", "relay",
+                    *common, *sender_global_args,
+                    "send", "--no-local", "--transport", "relay",
                     *send_args, source.name,
                 ],  # fmt: skip
                 cwd=send_dir,
@@ -617,42 +622,3 @@ def markdown_table(summary):
         )
     return "\n".join(lines) + "\n"
 
-
-# --- Bộ benchmark chưa đủ điều kiện ------------------------------------------
-
-
-def report_pending(suite, out, conditions):
-    """In điều kiện còn thiếu. Không sinh số liệu.
-
-    Trả về 0 (bỏ qua) khi còn thiếu điều kiện, 2 khi đã đủ mà phần đo chưa viết.
-    """
-    missing = [name for name, ok in conditions if not ok]
-    status = "pending" if missing else "not-implemented"
-    print(f"[{suite}] KHÔNG ĐO, không có số liệu.")
-    for name, ok in conditions:
-        print(f"  [{'đạt' if ok else 'THIẾU'}] {name}")
-    if not missing:
-        print("  Đã đủ điều kiện nhưng phần đo chưa được cài đặt.", file=sys.stderr)
-    if out:
-        out = prepare_out_dir(out)
-        write_json(out / "status.json", {"suite": suite, "status": status, "missing": missing})
-    return 0 if missing else 2
-
-
-def feature_conditions(new, base, flags, event, probe_args, **probe_options):
-    conditions = [("binary croc-upgraded được truyền qua --new", bool(new))]
-    if not new:
-        return conditions + [(f"binary --new có cờ {flag}", False) for flag in flags]
-    info = binary_info(new)
-    if Path(base).is_file():
-        conditions.append(
-            ("--new khác nội dung croc-base", info["sha256"] != sha256(Path(base)))
-        )
-    absent = missing_flags(new, flags)
-    conditions += [(f"binary --new có cờ {flag}", flag not in absent) for flag in flags]
-    emitted = False
-    if not absent:
-        relay = base if Path(base).is_file() else new
-        emitted = event in probe_events(new, relay, probe_args, **probe_options)
-    conditions.append((f"chạy thử một lượt thấy sự kiện telemetry {event}", emitted))
-    return conditions
