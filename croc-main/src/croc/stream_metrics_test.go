@@ -373,3 +373,64 @@ func readStreamStatLines(t *testing.T, path string) []parsedStreamStatLine {
 	}
 	return out
 }
+
+func TestStreamTrackerEdgeCasesAndLifecycleIdempotency(t *testing.T) {
+	// nil sink falls back safely to telemetry.Nop; invalid config fields normalize cleanly.
+	tracker := NewStreamTracker(nil, StreamTrackerConfig{
+		EWMAAlpha:          -1,
+		FastRatioThreshold: 2.0,
+		SlowRatioThreshold: 0.99,
+		MinStallObserve:    -5,
+		ColdStallObserve:   10 * time.Millisecond,
+		TelemetryInterval:  -1,
+	})
+
+	// Negative worker IDs and non-TCP / nil connections must be safe no-ops.
+	tracker.RegisterWorker(-1, 9009)
+	tracker.RegisterWorkerConn(0, nil)
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	tracker.RegisterWorkerConn(0, comm.New(c1))
+	tracker.MarkSendStart(-1, 0)
+	tracker.MarkSendFinish(-1)
+	tracker.RecordSendSample(-1, 0, 0)
+	tracker.RecordSendSample(0, 0, 0)
+	tracker.RecordSteal(-1)
+
+	// Cold stall on worker 1 before any sample has completed:
+	tracker.RecordSendSample(0, 32768, 2*time.Millisecond)
+	tracker.MarkSendStart(1, 0)
+	tracker.MarkSendStart(1, 32768)
+	time.Sleep(15 * time.Millisecond)
+	if tracker.MedianChunkDuration() <= 0 {
+		t.Fatalf("expected positive MedianChunkDuration with cold stall active")
+	}
+	if tier := tracker.ClassifyWorker(1); tier != WorkerSlow {
+		t.Fatalf("expected cold-stalled worker 1 to classify as Slow, got %s", tier)
+	}
+	tracker.MarkSendFinish(1)
+	tracker.MarkSendFinish(1)
+
+	// Start/Stop idempotency with real file sink and context cancellation.
+	jsonlPath := filepath.Join(t.TempDir(), "idempotent.jsonl")
+	sink, err := telemetry.Open(jsonlPath)
+	if err != nil {
+		t.Fatalf("telemetry.Open: %v", err)
+	}
+	t2 := NewStreamTracker(sink, StreamTrackerConfig{TelemetryInterval: 20 * time.Millisecond})
+	t2.EmitSnapshotNow() // empty worker map branch
+	t2.RegisterWorker(0, 9009)
+	t2.RecordSendSample(0, 1024, 0) // zero sendDur guard
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t2.Start(ctx)
+	t2.Start(ctx) // duplicate Start must be no-op
+	time.Sleep(25 * time.Millisecond)
+	cancel()
+	t2.Stop()
+	t2.Stop() // duplicate Stop must be no-op
+	if err := sink.Close(); err != nil {
+		t.Fatalf("sink.Close: %v", err)
+	}
+}

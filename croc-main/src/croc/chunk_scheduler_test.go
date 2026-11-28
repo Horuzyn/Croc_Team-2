@@ -2,6 +2,7 @@ package croc
 
 import (
 	"context"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -270,10 +271,10 @@ func TestChunkSchedulerLarge100GiBDoesNotMaterializeOffsets(t *testing.T) {
 		fileSize  = int64(100 << 30) // 100 GiB
 	)
 	sched := newStaticChunkScheduler(nil, fileSize, chunkSize, nil, nil)
-	if len(sched.cursor.ranges) != 3 {
-		t.Fatalf("expected 3 range entries for 100 GiB file, got %d", len(sched.cursor.ranges))
+	if len(sched.core.cursor.ranges) != 3 {
+		t.Fatalf("expected 3 range entries for 100 GiB file, got %d", len(sched.core.cursor.ranges))
 	}
-	if sched.completedSet.pages != nil || sched.issuedSet.pages != nil {
+	if sched.core.completedSet.pages != nil || sched.core.issuedSet.pages != nil {
 		t.Fatalf("expected zero bitset pages allocated at startup for 100 GiB file")
 	}
 }
@@ -636,5 +637,70 @@ func TestAdaptiveChunkSchedulerRaceStress(t *testing.T) {
 	st := sched.Stats()
 	if st.CompletedChunks != totalChunks || st.PendingChunks != 0 || st.InFlightChunks != 0 {
 		t.Fatalf("unexpected final race-stress stats: %+v", st)
+	}
+}
+
+func TestChunkSchedulerEnumsAndOverflowBounds(t *testing.T) {
+	stateTests := []struct {
+		state ChunkState
+		want  string
+	}{
+		{ChunkStatePending, "Pending"},
+		{ChunkStateInFlight, "InFlight"},
+		{ChunkStateDone, "Done"},
+		{ChunkState(99), "Unknown"},
+	}
+	for _, tc := range stateTests {
+		if got := tc.state.String(); got != tc.want {
+			t.Fatalf("ChunkState(%d).String() = %q, want %q", tc.state, got, tc.want)
+		}
+	}
+
+	tierTests := []struct {
+		tier WorkerTier
+		want string
+	}{
+		{WorkerNormal, "Normal"},
+		{WorkerFast, "Fast"},
+		{WorkerSlow, "Slow"},
+		{WorkerTier(99), "Unknown"},
+	}
+	for _, tc := range tierTests {
+		if got := tc.tier.String(); got != tc.want {
+			t.Fatalf("WorkerTier(%d).String() = %q, want %q", tc.tier, got, tc.want)
+		}
+	}
+
+	// Empty 0-byte file must reject ReenqueueRanges safely without spinning.
+	emptySched := newStaticChunkScheduler(nil, 0, 32, nil, nil)
+	if _, stolen := emptySched.Steal(0); stolen {
+		t.Fatalf("static Steal must always return false")
+	}
+	if n := emptySched.ReenqueueRanges([]int64{32, 0, math.MaxInt64}); n != 0 {
+		t.Fatalf("expected 0 chunks enqueued on 0-byte file, got %d", n)
+	}
+
+	// Unsorted initial ranges + huge count overflow guard + high worker IDs (>=16).
+	unsortedRanges := []int64{32, 64, 1, 0, 2}
+	dynSched := newAdaptiveChunkScheduler(unsortedRanges, 128, 32, nil, nil, AdaptiveSchedulerConfig{
+		SlowMinCooldown: 10 * time.Millisecond,
+		SlowMaxCooldown: 2 * time.Millisecond, // exercises SlowMaxCooldown < SlowMinCooldown clamp
+	})
+
+	// Worker ID 20 exercises largeTiers snapshot map (>15).
+	tk, ok := dynSched.Claim(20)
+	if !ok {
+		t.Fatalf("expected high workerID=20 to claim chunk")
+	}
+	dynSched.Complete(20, tk, 32, time.Millisecond)
+
+	// Huge count must be clamped strictly by fileSize (128 bytes = 4 chunks max, 0..96) without int64 overflow!
+	enqueued := dynSched.ReenqueueRanges([]int64{
+		32,
+		64, math.MaxInt64, // clamped to offsets 64, 96
+		math.MaxInt64 - 8, 10000000, // >= fileSize -> safely ignored
+	})
+	if enqueued != 2 {
+		t.Fatalf("expected clamped ReenqueueRanges to enqueue 2 chunks (64, 96), got %d", enqueued)
 	}
 }

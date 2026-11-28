@@ -2,6 +2,7 @@ package croc
 
 import (
 	"context"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -21,10 +22,8 @@ const (
 	// SchedModeDynamic enables per-stream throughput tracking, slow-stream pacing, and work-stealing.
 	SchedModeDynamic = "dynamic"
 
-	// pagedBitsetBitsPerWord is 64 bits per uint64 word.
-	pagedBitsetBitsPerWord = 64
-	// pagedBitsetWordsPerPage is 512 words (4 KiB), covering 32,768 chunks (~1 GiB at 32 KiB/chunk).
-	pagedBitsetWordsPerPage = 512
+	pagedBitsetBitsPerWord  = 64
+	pagedBitsetWordsPerPage = 512 // 4 KiB per page, covering 32,768 chunks (~1 GiB at 32 KiB/chunk)
 	pagedBitsetBitsPerPage  = pagedBitsetBitsPerWord * pagedBitsetWordsPerPage
 
 	// MaxConcurrentChunkOwners caps how many workers may hold the same chunk simultaneously
@@ -111,31 +110,12 @@ type SchedulerStats struct {
 // sleep, or invoke external callbacks (onDone, StreamSpeedInspector) while
 // holding internal mutexes.
 type ChunkScheduler interface {
-	// Acquire returns the next chunk ticket for workerID, waiting if needed
-	// until work becomes available, all chunks complete, or ctx is canceled.
 	Acquire(ctx context.Context, workerID int) (ChunkTicket, bool)
-
-	// Claim performs a non-blocking attempt to pop a Pending chunk for workerID.
 	Claim(workerID int) (ChunkTicket, bool)
-
-	// Steal performs a non-blocking attempt to duplicate an overdue InFlight
-	// chunk onto a faster worker.
 	Steal(workerID int) (ChunkTicket, bool)
-
-	// Complete marks ticket.Offset as Done and reports send duration outside locks.
-	// Returns firstCompletion=true iff this call transitioned the chunk to Done.
 	Complete(workerID int, ticket ChunkTicket, bytesSent int, sendDur time.Duration) (firstCompletion bool)
-
-	// Release returns an uncompleted InFlight chunk back to the Pending requeue
-	// FIFO when a worker encounters an I/O or socket error before completion.
 	Release(workerID int, ticket ChunkTicket)
-
-	// ReenqueueRanges schedules corrupted or missing chunk ranges (in standard
-	// croc ChunkRanges format: [chunkSize, startOffset1, count1, ...]) for
-	// selective retransmission. Returns the number of chunks enqueued.
 	ReenqueueRanges(ranges []int64) int
-
-	// Stats returns a thread-safe snapshot of current scheduler metrics.
 	Stats() SchedulerStats
 }
 
@@ -217,8 +197,7 @@ func (e *inflightChunkState) oldestElapsed(now time.Time) time.Duration {
 
 // pagedChunkBitset tracks chunk indices in lazily allocated 4 KiB pages so
 // initializing a 100 GiB transfer allocates 0 bytes upfront while providing O(1)
-// lookup, set, and clear operations. Unaligned synthetic test offsets fall back
-// to a small map allocated only on demand.
+// lookup, set, and clear operations.
 type pagedChunkBitset struct {
 	chunkSize int64
 	pages     map[uint64]*[pagedBitsetWordsPerPage]uint64
@@ -263,7 +242,6 @@ func (b *pagedChunkBitset) Test(offset int64) bool {
 	return (page[wordIdx] & mask) != 0
 }
 
-// Set marks offset and returns true iff offset was not previously set.
 func (b *pagedChunkBitset) Set(offset int64) bool {
 	pageIdx, wordIdx, mask, aligned := b.splitAligned(offset)
 	if !aligned {
@@ -291,7 +269,6 @@ func (b *pagedChunkBitset) Set(offset int64) bool {
 	return true
 }
 
-// Clear unmarks offset and returns true iff offset was previously set.
 func (b *pagedChunkBitset) Clear(offset int64) bool {
 	pageIdx, wordIdx, mask, aligned := b.splitAligned(offset)
 	if !aligned {
@@ -344,8 +321,20 @@ func newLazyChunkRangeCursor(ranges []int64, fileSize, defaultChunkSize int64) l
 		}
 	}
 
-	total := 0
-	sorted := true
+	total, sorted := countAndCheckSortedRanges(ranges, chunkSize)
+	return lazyChunkRangeCursor{
+		ranges:    ranges,
+		chunkSize: chunkSize,
+		fileSize:  fileSize,
+		next:      1,
+		total:     total,
+		remaining: total,
+		sorted:    sorted,
+	}
+}
+
+func countAndCheckSortedRanges(ranges []int64, chunkSize int64) (total int, sorted bool) {
+	sorted = true
 	var prevEnd int64
 	hasPrev := false
 	for i := 1; i+1 < len(ranges); i += 2 {
@@ -360,16 +349,7 @@ func newLazyChunkRangeCursor(ranges []int64, fileSize, defaultChunkSize int64) l
 		prevEnd = start + count*chunkSize
 		hasPrev = true
 	}
-
-	return lazyChunkRangeCursor{
-		ranges:    ranges,
-		chunkSize: chunkSize,
-		fileSize:  fileSize,
-		next:      1,
-		total:     total,
-		remaining: total,
-		sorted:    sorted,
-	}
+	return total, sorted
 }
 
 func (c *lazyChunkRangeCursor) nextOffset() (int64, bool) {
@@ -390,25 +370,7 @@ func (c *lazyChunkRangeCursor) containsInitialOffset(offset int64) bool {
 		return false
 	}
 	if c.sorted {
-		if !utils.ChunkRangesContain(c.ranges, offset) {
-			return false
-		}
-		// Verify alignment with the matching range start.
-		pairs := (len(c.ranges) - 1) / 2
-		low, high := 0, pairs
-		for low < high {
-			mid := low + (high-low)/2
-			if c.ranges[1+mid*2] <= offset {
-				low = mid + 1
-			} else {
-				high = mid
-			}
-		}
-		if low == 0 {
-			return false
-		}
-		start := c.ranges[1+(low-1)*2]
-		return (offset-start)%c.chunkSize == 0
+		return c.containsSortedOffset(offset)
 	}
 	for i := 1; i+1 < len(c.ranges); i += 2 {
 		start, count := c.ranges[i], c.ranges[i+1]
@@ -422,11 +384,30 @@ func (c *lazyChunkRangeCursor) containsInitialOffset(offset int64) bool {
 	return false
 }
 
-// staticChunkScheduler implements ChunkScheduler with sequential range claiming
-// (no speculative work-stealing) while supporting Release, ReenqueueRanges,
-// idempotent completion accounting, and strict lock-free I/O boundaries.
-type staticChunkScheduler struct {
-	mu              sync.Mutex
+func (c *lazyChunkRangeCursor) containsSortedOffset(offset int64) bool {
+	if !utils.ChunkRangesContain(c.ranges, offset) {
+		return false
+	}
+	pairs := (len(c.ranges) - 1) / 2
+	low, high := 0, pairs
+	for low < high {
+		mid := low + (high-low)/2
+		if c.ranges[1+mid*2] <= offset {
+			low = mid + 1
+		} else {
+			high = mid
+		}
+	}
+	if low == 0 {
+		return false
+	}
+	start := c.ranges[1+(low-1)*2]
+	return (offset-start)%c.chunkSize == 0
+}
+
+// schedulerCoreState holds the shared lock-protected queue, bitsets, and wakeup
+// channel reused by both staticChunkScheduler and adaptiveChunkScheduler.
+type schedulerCoreState struct {
 	cursor          lazyChunkRangeCursor
 	requeued        []int64
 	requeuedPending pagedChunkBitset
@@ -438,6 +419,166 @@ type staticChunkScheduler struct {
 	completed       int
 	requeuedTotal   uint64
 	wakeupCh        chan struct{}
+}
+
+func newSchedulerCoreState(ranges []int64, fileSize, chunkSize int64) schedulerCoreState {
+	cursor := newLazyChunkRangeCursor(ranges, fileSize, chunkSize)
+	effChunkSize := cursor.chunkSize
+	return schedulerCoreState{
+		cursor:          cursor,
+		requeuedPending: newPagedChunkBitset(effChunkSize),
+		issuedSet:       newPagedChunkBitset(effChunkSize),
+		completedSet:    newPagedChunkBitset(effChunkSize),
+		extraTargets:    newPagedChunkBitset(effChunkSize),
+		inFlight:        make(map[int64]*inflightChunkState),
+		total:           cursor.total,
+		wakeupCh:        make(chan struct{}),
+	}
+}
+
+func (c *schedulerCoreState) broadcastLocked() {
+	close(c.wakeupCh)
+	c.wakeupCh = make(chan struct{})
+}
+
+func (c *schedulerCoreState) pendingCountLocked() int {
+	return c.cursor.remaining + len(c.requeued)
+}
+
+func (c *schedulerCoreState) isFinishedLocked() bool {
+	return c.completed == c.total && c.cursor.remaining == 0 && len(c.requeued) == 0
+}
+
+func (c *schedulerCoreState) popRequeuedLocked(workerID int, now time.Time) (ChunkTicket, bool) {
+	for len(c.requeued) > 0 {
+		offset := c.requeued[0]
+		c.requeued[0] = 0
+		c.requeued = c.requeued[1:]
+		if len(c.requeued) == 0 {
+			c.requeued = nil
+		}
+		c.requeuedPending.Clear(offset)
+		if c.completedSet.Test(offset) {
+			continue
+		}
+		if existing := c.inFlight[offset]; existing != nil {
+			if !existing.hasPrimary {
+				existing.hasPrimary = true
+				existing.primaryWorkerID = workerID
+				existing.primaryStartedAt = now
+				return ChunkTicket{Offset: offset, IsStolen: false}, true
+			}
+			continue
+		}
+		c.issuedSet.Set(offset)
+		c.inFlight[offset] = newInflightChunkState(offset, workerID, now)
+		return ChunkTicket{Offset: offset, IsStolen: false}, true
+	}
+	return ChunkTicket{}, false
+}
+
+func (c *schedulerCoreState) popCursorSequentialLocked(workerID int, now time.Time) (ChunkTicket, bool) {
+	for {
+		offset, ok := c.cursor.nextOffset()
+		if !ok {
+			return ChunkTicket{}, false
+		}
+		c.issuedSet.Set(offset)
+		if c.completedSet.Test(offset) {
+			continue
+		}
+		c.inFlight[offset] = newInflightChunkState(offset, workerID, now)
+		return ChunkTicket{Offset: offset, IsStolen: false}, true
+	}
+}
+
+func (c *schedulerCoreState) releaseTicketLocked(workerID int, ticket ChunkTicket) {
+	if c.completedSet.Test(ticket.Offset) {
+		delete(c.inFlight, ticket.Offset)
+		return
+	}
+	entry := c.inFlight[ticket.Offset]
+	remaining := 0
+	if entry != nil {
+		remaining = entry.detachWorker(workerID, ticket.IsStolen)
+		if remaining == 0 {
+			delete(c.inFlight, ticket.Offset)
+		}
+	}
+	if remaining == 0 && c.requeuedPending.Set(ticket.Offset) {
+		c.requeued = append(c.requeued, ticket.Offset)
+		c.requeuedTotal++
+	}
+	c.broadcastLocked()
+}
+
+func (c *schedulerCoreState) reenqueueRangesLocked(ranges []int64) int {
+	if len(ranges) < 3 {
+		return 0
+	}
+	if c.cursor.fileSize <= 0 && c.cursor.total == 0 {
+		return 0
+	}
+	rangeChunkSize := ranges[0]
+	if rangeChunkSize <= 0 {
+		rangeChunkSize = c.cursor.chunkSize
+	}
+	enqueued := 0
+	for i := 1; i+1 < len(ranges); i += 2 {
+		enqueued += c.reenqueuePairLocked(ranges[i], ranges[i+1], rangeChunkSize)
+	}
+	if enqueued > 0 {
+		c.broadcastLocked()
+	}
+	return enqueued
+}
+
+func (c *schedulerCoreState) reenqueuePairLocked(start, count, chunkSize int64) int {
+	if start < 0 || count <= 0 || chunkSize <= 0 {
+		return 0
+	}
+	maxSteps := (math.MaxInt64 - start) / chunkSize
+	if c.cursor.fileSize > 0 {
+		if start >= c.cursor.fileSize {
+			return 0
+		}
+		fileSteps := (c.cursor.fileSize - 1 - start) / chunkSize
+		if fileSteps < maxSteps {
+			maxSteps = fileSteps
+		}
+	}
+	if count-1 > maxSteps {
+		count = maxSteps + 1
+	}
+
+	added := 0
+	for j := int64(0); j < count; j++ {
+		offset := start + j*chunkSize
+		inTarget := c.cursor.containsInitialOffset(offset) || c.extraTargets.Test(offset)
+		if !inTarget {
+			c.extraTargets.Set(offset)
+			c.issuedSet.Set(offset)
+			c.total++
+		} else if c.completedSet.Clear(offset) {
+			c.completed--
+		} else if !c.issuedSet.Test(offset) {
+			continue
+		}
+		if c.requeuedPending.Set(offset) {
+			c.requeued = append(c.requeued, offset)
+			c.requeuedTotal++
+			added++
+		}
+	}
+	return added
+}
+
+// staticChunkScheduler implements ChunkScheduler with sequential range claiming
+// (no speculative work-stealing) while supporting Release, ReenqueueRanges,
+// idempotent completion accounting, and strict lock-free I/O boundaries.
+type staticChunkScheduler struct {
+	mu   sync.Mutex
+	core schedulerCoreState
 
 	inspector StreamSpeedInspector
 	doneOnce  sync.Once
@@ -451,29 +592,15 @@ func newStaticChunkScheduler(
 	inspector StreamSpeedInspector,
 	onDone func(),
 ) *staticChunkScheduler {
-	cursor := newLazyChunkRangeCursor(ranges, fileSize, chunkSize)
-	effChunkSize := cursor.chunkSize
 	s := &staticChunkScheduler{
-		cursor:          cursor,
-		requeuedPending: newPagedChunkBitset(effChunkSize),
-		issuedSet:       newPagedChunkBitset(effChunkSize),
-		completedSet:    newPagedChunkBitset(effChunkSize),
-		extraTargets:    newPagedChunkBitset(effChunkSize),
-		inFlight:        make(map[int64]*inflightChunkState),
-		total:           cursor.total,
-		wakeupCh:        make(chan struct{}),
-		inspector:       inspector,
-		onDone:          onDone,
+		core:      newSchedulerCoreState(ranges, fileSize, chunkSize),
+		inspector: inspector,
+		onDone:    onDone,
 	}
-	if s.total == 0 {
+	if s.core.total == 0 {
 		s.signalDone()
 	}
 	return s
-}
-
-func (s *staticChunkScheduler) broadcastLocked() {
-	close(s.wakeupCh)
-	s.wakeupCh = make(chan struct{})
 }
 
 func (s *staticChunkScheduler) signalDone() {
@@ -486,34 +613,23 @@ func (s *staticChunkScheduler) signalDone() {
 
 func (s *staticChunkScheduler) Acquire(ctx context.Context, workerID int) (ChunkTicket, bool) {
 	for {
-		if ctx != nil {
-			if err := ctx.Err(); err != nil {
-				return ChunkTicket{}, false
-			}
+		if ctx != nil && ctx.Err() != nil {
+			return ChunkTicket{}, false
 		}
-
 		s.mu.Lock()
 		if ticket, ok := s.claimLocked(workerID, time.Now()); ok {
 			s.mu.Unlock()
 			return ticket, true
 		}
-		if s.isFinishedLocked() {
+		if s.core.isFinishedLocked() {
 			s.mu.Unlock()
 			return ChunkTicket{}, false
 		}
-		// All Pending chunks have been claimed, but some InFlight chunks are still
-		// running (which might fail and call Release, or finish the transfer).
-		waitCh := s.wakeupCh
+		waitCh := s.core.wakeupCh
 		s.mu.Unlock()
 
-		if ctx == nil {
-			<-waitCh
-			continue
-		}
-		select {
-		case <-ctx.Done():
+		if !waitChannelOrCtx(ctx, waitCh) {
 			return ChunkTicket{}, false
-		case <-waitCh:
 		}
 	}
 }
@@ -526,69 +642,30 @@ func (s *staticChunkScheduler) Claim(workerID int) (ChunkTicket, bool) {
 }
 
 func (s *staticChunkScheduler) claimLocked(workerID int, now time.Time) (ChunkTicket, bool) {
-	for len(s.requeued) > 0 {
-		offset := s.requeued[0]
-		s.requeued[0] = 0
-		s.requeued = s.requeued[1:]
-		if len(s.requeued) == 0 {
-			s.requeued = nil
-		}
-		s.requeuedPending.Clear(offset)
-		if s.completedSet.Test(offset) {
-			continue
-		}
-		if existing := s.inFlight[offset]; existing != nil {
-			if !existing.hasPrimary {
-				existing.hasPrimary = true
-				existing.primaryWorkerID = workerID
-				existing.primaryStartedAt = now
-				return ChunkTicket{Offset: offset, IsStolen: false}, true
-			}
-			continue
-		}
-		s.issuedSet.Set(offset)
-		s.inFlight[offset] = newInflightChunkState(offset, workerID, now)
-		return ChunkTicket{Offset: offset, IsStolen: false}, true
+	if ticket, ok := s.core.popRequeuedLocked(workerID, now); ok {
+		return ticket, true
 	}
-
-	for {
-		offset, ok := s.cursor.nextOffset()
-		if !ok {
-			return ChunkTicket{}, false
-		}
-		s.issuedSet.Set(offset)
-		if s.completedSet.Test(offset) {
-			continue
-		}
-		s.inFlight[offset] = newInflightChunkState(offset, workerID, now)
-		return ChunkTicket{Offset: offset, IsStolen: false}, true
-	}
+	return s.core.popCursorSequentialLocked(workerID, now)
 }
 
-// Steal always returns false in static scheduling mode.
 func (s *staticChunkScheduler) Steal(_ int) (ChunkTicket, bool) {
 	return ChunkTicket{}, false
 }
 
 func (s *staticChunkScheduler) Complete(workerID int, ticket ChunkTicket, bytesSent int, sendDur time.Duration) bool {
 	s.mu.Lock()
-	if entry := s.inFlight[ticket.Offset]; entry != nil {
-		if entry.detachWorker(workerID, ticket.IsStolen) == 0 {
-			delete(s.inFlight, ticket.Offset)
-		}
-	}
-	firstCompletion := s.completedSet.Set(ticket.Offset)
+	delete(s.core.inFlight, ticket.Offset)
+	firstCompletion := s.core.completedSet.Set(ticket.Offset)
 	if firstCompletion {
-		s.completed++
+		s.core.completed++
 	}
-	finished := s.isFinishedLocked()
-	if finished || len(s.inFlight) == 0 {
-		s.broadcastLocked()
+	finished := s.core.isFinishedLocked()
+	if finished || len(s.core.inFlight) == 0 {
+		s.core.broadcastLocked()
 	}
 	inspector := s.inspector
 	s.mu.Unlock()
 
-	// Strictly outside s.mu: report speed metrics and run completion callback.
 	if inspector != nil {
 		inspector.RecordSendSample(workerID, bytesSent, sendDur)
 	}
@@ -600,66 +677,13 @@ func (s *staticChunkScheduler) Complete(workerID int, ticket ChunkTicket, bytesS
 
 func (s *staticChunkScheduler) Release(workerID int, ticket ChunkTicket) {
 	s.mu.Lock()
-	entry := s.inFlight[ticket.Offset]
-	remaining := 0
-	if entry != nil {
-		remaining = entry.detachWorker(workerID, ticket.IsStolen)
-		if remaining == 0 {
-			delete(s.inFlight, ticket.Offset)
-		}
-	}
-	if remaining == 0 && !s.completedSet.Test(ticket.Offset) {
-		if s.requeuedPending.Set(ticket.Offset) {
-			s.requeued = append(s.requeued, ticket.Offset)
-			s.requeuedTotal++
-		}
-	}
-	s.broadcastLocked()
+	s.core.releaseTicketLocked(workerID, ticket)
 	s.mu.Unlock()
 }
 
 func (s *staticChunkScheduler) ReenqueueRanges(ranges []int64) int {
-	if len(ranges) < 3 {
-		return 0
-	}
-	rangeChunkSize := ranges[0]
 	s.mu.Lock()
-	if rangeChunkSize <= 0 {
-		rangeChunkSize = s.cursor.chunkSize
-	}
-	enqueued := 0
-	for i := 1; i+1 < len(ranges); i += 2 {
-		start, count := ranges[i], ranges[i+1]
-		if start < 0 || count <= 0 {
-			continue
-		}
-		for j := int64(0); j < count; j++ {
-			offset := start + j*rangeChunkSize
-			if s.cursor.fileSize > 0 && offset >= s.cursor.fileSize {
-				break
-			}
-			inTarget := s.cursor.containsInitialOffset(offset) || s.extraTargets.Test(offset)
-			if !inTarget {
-				s.extraTargets.Set(offset)
-				s.issuedSet.Set(offset)
-				s.total++
-			} else if s.completedSet.Clear(offset) {
-				s.completed--
-			} else if !s.issuedSet.Test(offset) {
-				// Still untouched in the lazy range cursor; will be claimed naturally.
-				continue
-			}
-
-			if s.requeuedPending.Set(offset) {
-				s.requeued = append(s.requeued, offset)
-				s.requeuedTotal++
-				enqueued++
-			}
-		}
-	}
-	if enqueued > 0 {
-		s.broadcastLocked()
-	}
+	enqueued := s.core.reenqueueRangesLocked(ranges)
 	s.mu.Unlock()
 	return enqueued
 }
@@ -667,19 +691,15 @@ func (s *staticChunkScheduler) ReenqueueRanges(ranges []int64) int {
 func (s *staticChunkScheduler) Stats() SchedulerStats {
 	s.mu.Lock()
 	stats := SchedulerStats{
-		TotalChunks:     s.total,
-		CompletedChunks: s.completed,
-		PendingChunks:   s.cursor.remaining + len(s.requeued),
-		InFlightChunks:  len(s.inFlight),
+		TotalChunks:     s.core.total,
+		CompletedChunks: s.core.completed,
+		PendingChunks:   s.core.pendingCountLocked(),
+		InFlightChunks:  len(s.core.inFlight),
 		StolenChunks:    0,
-		RequeuedChunks:  s.requeuedTotal,
+		RequeuedChunks:  s.core.requeuedTotal,
 	}
 	s.mu.Unlock()
 	return stats
-}
-
-func (s *staticChunkScheduler) isFinishedLocked() bool {
-	return s.completed == s.total && s.cursor.remaining == 0 && len(s.requeued) == 0
 }
 
 // AdaptiveSchedulerConfig controls pacing and work-stealing thresholds for
@@ -781,20 +801,10 @@ type adaptiveChunkScheduler struct {
 	inspector   StreamSpeedInspector
 	maxWorkerID atomic.Int32
 
-	mu              sync.Mutex
-	cursor          lazyChunkRangeCursor
-	requeued        []int64
-	requeuedPending pagedChunkBitset
-	issuedSet       pagedChunkBitset
-	completedSet    pagedChunkBitset
-	extraTargets    pagedChunkBitset
-	inFlight        map[int64]*inflightChunkState
-	workerLastSeen  map[int]time.Time
-	total           int
-	completed       int
-	stolenTotal     uint64
-	requeuedTotal   uint64
-	wakeupCh        chan struct{}
+	mu             sync.Mutex
+	core           schedulerCoreState
+	workerLastSeen map[int]time.Time
+	stolenTotal    uint64
 
 	doneOnce sync.Once
 	onDone   func()
@@ -817,31 +827,20 @@ func newAdaptiveChunkScheduler(
 	if inspector == nil {
 		inspector = NewStreamTracker(telemetry.Nop)
 	}
-	cursor := newLazyChunkRangeCursor(ranges, fileSize, chunkSize)
-	effChunkSize := cursor.chunkSize
 	s := &adaptiveChunkScheduler{
-		cfg:             resolvedCfg,
-		inspector:       inspector,
-		cursor:          cursor,
-		requeuedPending: newPagedChunkBitset(effChunkSize),
-		issuedSet:       newPagedChunkBitset(effChunkSize),
-		completedSet:    newPagedChunkBitset(effChunkSize),
-		extraTargets:    newPagedChunkBitset(effChunkSize),
-		inFlight:        make(map[int64]*inflightChunkState),
-		workerLastSeen:  make(map[int]time.Time),
-		total:           cursor.total,
-		wakeupCh:        make(chan struct{}),
-		onDone:          onDone,
+		cfg:            resolvedCfg,
+		inspector:      inspector,
+		core:           newSchedulerCoreState(ranges, fileSize, chunkSize),
+		workerLastSeen: make(map[int]time.Time),
+		onDone:         onDone,
 	}
 	s.maxWorkerID.Store(-1)
-	if s.total == 0 {
+	if s.core.total == 0 {
 		s.signalDone()
 	}
 	return s
 }
 
-// newChunkSchedulerByMode constructs either the dynamic work-stealing scheduler
-// or the static sequential baseline scheduler according to mode.
 func newChunkSchedulerByMode(
 	mode string,
 	ranges []int64,
@@ -871,8 +870,6 @@ func (s *adaptiveChunkScheduler) observeWorkerID(workerID int) {
 	}
 }
 
-// snapshotSpeed queries StreamSpeedInspector strictly outside s.mu so zero locks
-// are nested between ChunkScheduler and StreamTracker.
 func (s *adaptiveChunkScheduler) snapshotSpeed(workerID int) speedSnapshot {
 	s.observeWorkerID(workerID)
 	snap := speedSnapshot{maxID: int(s.maxWorkerID.Load())}
@@ -893,11 +890,6 @@ func (s *adaptiveChunkScheduler) snapshotSpeed(workerID int) speedSnapshot {
 	return snap
 }
 
-func (s *adaptiveChunkScheduler) broadcastLocked() {
-	close(s.wakeupCh)
-	s.wakeupCh = make(chan struct{})
-}
-
 func (s *adaptiveChunkScheduler) signalDone() {
 	s.doneOnce.Do(func() {
 		if s.onDone != nil {
@@ -909,99 +901,118 @@ func (s *adaptiveChunkScheduler) signalDone() {
 func (s *adaptiveChunkScheduler) Acquire(ctx context.Context, workerID int) (ChunkTicket, bool) {
 	didCooldown := false
 	for {
-		if ctx != nil {
-			if err := ctx.Err(); err != nil {
-				return ChunkTicket{}, false
-			}
+		if ctx != nil && ctx.Err() != nil {
+			return ChunkTicket{}, false
 		}
-
 		snap := s.snapshotSpeed(workerID)
-		tier := snap.tierOf(workerID)
-		now := time.Now()
-
-		s.mu.Lock()
-		s.workerLastSeen[workerID] = now
-		if s.isFinishedLocked() {
-			s.mu.Unlock()
-			return ChunkTicket{}, false
+		ticket, gotTicket, finished, sleptOrCanceled := s.stepAcquire(ctx, workerID, &snap, &didCooldown)
+		if gotTicket {
+			return ticket, true
 		}
-
-		healthyPeers := s.healthyPeerCountLocked(workerID, now, &snap)
-
-		// Slow-stream pacing: apply a bounded cooldown once per Acquire cycle
-		// before handing new work to a degraded connection, strictly outside s.mu.
-		if !didCooldown && tier == WorkerSlow && healthyPeers > 0 && s.pendingCountLocked() > 0 {
-			cooldown := s.computeSlowCooldown(snap.medianDur)
-			waitCh := s.wakeupCh
-			s.mu.Unlock()
-			didCooldown = true
-			if !waitWithWakeup(ctx, waitCh, cooldown) {
+		if finished || sleptOrCanceled {
+			if finished {
 				return ChunkTicket{}, false
 			}
-			continue
-		}
-
-		// Priority 1: Requeued chunks (unassigned failed/repaired chunks) always go first.
-		if ticket, ok := s.popRequeuedLocked(workerID, now); ok {
-			s.mu.Unlock()
-			return ticket, true
-		}
-
-		// Priority 2: Mid-transfer speculative steal if an InFlight chunk has stalled
-		// past max(3 * median_chunk_time, MinMidStealThreshold).
-		if tier != WorkerSlow || healthyPeers == 0 {
-			if ticket, ok := s.stealLocked(workerID, now, &snap, true); ok {
-				inspector := s.inspector
-				s.mu.Unlock()
-				if inspector != nil {
-					inspector.RecordSteal(workerID)
-				}
-				return ticket, true
+			if ctx != nil && ctx.Err() != nil {
+				return ChunkTicket{}, false
 			}
 		}
+	}
+}
 
-		// Priority 3: Claim fresh Pending chunk from lazy cursor (enforcing Tail Protection).
-		if ticket, ok := s.claimCursorLocked(workerID, now, tier, healthyPeers); ok {
-			s.mu.Unlock()
-			return ticket, true
-		}
+func (s *adaptiveChunkScheduler) stepAcquire(
+	ctx context.Context,
+	workerID int,
+	snap *speedSnapshot,
+	didCooldown *bool,
+) (ticket ChunkTicket, gotTicket bool, finished bool, waited bool) {
+	tier := snap.tierOf(workerID)
+	now := time.Now()
 
-		// Priority 4: Endgame work-stealing when Pending == 0.
-		if s.pendingCountLocked() == 0 && (tier != WorkerSlow || healthyPeers == 0) {
-			if ticket, ok := s.stealLocked(workerID, now, &snap, false); ok {
-				inspector := s.inspector
-				s.mu.Unlock()
-				if inspector != nil {
-					inspector.RecordSteal(workerID)
-				}
-				return ticket, true
-			}
-		}
-
-		if s.isFinishedLocked() {
-			s.mu.Unlock()
-			return ChunkTicket{}, false
-		}
-
-		waitDur, useTimer := s.nextWaitDurationLocked(workerID, now, tier, healthyPeers, &snap)
-		waitCh := s.wakeupCh
+	s.mu.Lock()
+	s.workerLastSeen[workerID] = now
+	if s.core.isFinishedLocked() {
 		s.mu.Unlock()
+		return ChunkTicket{}, false, true, false
+	}
 
-		if useTimer {
-			if !waitWithWakeup(ctx, waitCh, waitDur) {
-				return ChunkTicket{}, false
-			}
-		} else {
-			if ctx == nil {
-				<-waitCh
-			} else {
-				select {
-				case <-ctx.Done():
-					return ChunkTicket{}, false
-				case <-waitCh:
-				}
-			}
+	healthyPeers := s.healthyPeerCountLocked(workerID, now, snap)
+	if !*didCooldown && tier == WorkerSlow && healthyPeers > 0 && s.core.pendingCountLocked() > 0 {
+		cooldown := s.computeSlowCooldown(snap.medianDur)
+		waitCh := s.core.wakeupCh
+		s.mu.Unlock()
+		*didCooldown = true
+		if !waitWithWakeup(ctx, waitCh, cooldown) {
+			return ChunkTicket{}, false, true, true
 		}
+		return ChunkTicket{}, false, false, true
+	}
+
+	ticket, gotTicket, stole := s.trySelectWorkLocked(workerID, now, tier, healthyPeers, snap)
+	if gotTicket {
+		inspector := s.inspector
+		s.mu.Unlock()
+		if stole && inspector != nil {
+			inspector.RecordSteal(workerID)
+		}
+		return ticket, true, false, false
+	}
+
+	if s.core.isFinishedLocked() {
+		s.mu.Unlock()
+		return ChunkTicket{}, false, true, false
+	}
+
+	waitDur, useTimer := s.nextWaitDurationLocked(workerID, now, tier, healthyPeers, snap)
+	waitCh := s.core.wakeupCh
+	s.mu.Unlock()
+
+	ok := false
+	if useTimer {
+		ok = waitWithWakeup(ctx, waitCh, waitDur)
+	} else {
+		ok = waitChannelOrCtx(ctx, waitCh)
+	}
+	return ChunkTicket{}, false, !ok, true
+}
+
+func (s *adaptiveChunkScheduler) trySelectWorkLocked(
+	workerID int,
+	now time.Time,
+	tier WorkerTier,
+	healthyPeers int,
+	snap *speedSnapshot,
+) (ticket ChunkTicket, ok bool, stole bool) {
+	if tk, claimed := s.core.popRequeuedLocked(workerID, now); claimed {
+		return tk, true, false
+	}
+	canSteal := tier != WorkerSlow || healthyPeers == 0
+	if canSteal {
+		if tk, stolen := s.stealLocked(workerID, now, snap, true); stolen {
+			return tk, true, true
+		}
+	}
+	if tk, claimed := s.claimCursorLocked(workerID, now, tier, healthyPeers); claimed {
+		return tk, true, false
+	}
+	if s.core.pendingCountLocked() == 0 && canSteal {
+		if tk, stolen := s.stealLocked(workerID, now, snap, false); stolen {
+			return tk, true, true
+		}
+	}
+	return ChunkTicket{}, false, false
+}
+
+func waitChannelOrCtx(ctx context.Context, waitCh <-chan struct{}) bool {
+	if ctx == nil {
+		<-waitCh
+		return true
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-waitCh:
+		return true
 	}
 }
 
@@ -1033,7 +1044,7 @@ func (s *adaptiveChunkScheduler) Claim(workerID int) (ChunkTicket, bool) {
 
 	s.mu.Lock()
 	s.workerLastSeen[workerID] = now
-	if ticket, ok := s.popRequeuedLocked(workerID, now); ok {
+	if ticket, ok := s.core.popRequeuedLocked(workerID, now); ok {
 		s.mu.Unlock()
 		return ticket, true
 	}
@@ -1055,7 +1066,7 @@ func (s *adaptiveChunkScheduler) Steal(workerID int) (ChunkTicket, bool) {
 		s.mu.Unlock()
 		return ChunkTicket{}, false
 	}
-	midOnly := s.pendingCountLocked() > 0
+	midOnly := s.core.pendingCountLocked() > 0
 	ticket, ok := s.stealLocked(workerID, now, &snap, midOnly)
 	inspector := s.inspector
 	s.mu.Unlock()
@@ -1072,22 +1083,19 @@ func (s *adaptiveChunkScheduler) Complete(workerID int, ticket ChunkTicket, byte
 
 	s.mu.Lock()
 	s.workerLastSeen[workerID] = now
-	// Once any owner finishes the chunk, remove it from inFlight immediately so no
-	// other worker attempts to steal an already-completed chunk.
-	delete(s.inFlight, ticket.Offset)
+	delete(s.core.inFlight, ticket.Offset)
 
-	firstCompletion := s.completedSet.Set(ticket.Offset)
+	firstCompletion := s.core.completedSet.Set(ticket.Offset)
 	if firstCompletion {
-		s.completed++
+		s.core.completed++
 	}
-	finished := s.isFinishedLocked()
-	if finished || s.pendingCountLocked() == 0 || len(s.inFlight) == 0 {
-		s.broadcastLocked()
+	finished := s.core.isFinishedLocked()
+	if finished || s.core.pendingCountLocked() == 0 || len(s.core.inFlight) == 0 {
+		s.core.broadcastLocked()
 	}
 	inspector := s.inspector
 	s.mu.Unlock()
 
-	// Strictly outside s.mu: report send sample and run onDone callback.
 	if inspector != nil {
 		inspector.RecordSendSample(workerID, bytesSent, sendDur)
 	}
@@ -1100,70 +1108,13 @@ func (s *adaptiveChunkScheduler) Complete(workerID int, ticket ChunkTicket, byte
 func (s *adaptiveChunkScheduler) Release(workerID int, ticket ChunkTicket) {
 	s.observeWorkerID(workerID)
 	s.mu.Lock()
-	if s.completedSet.Test(ticket.Offset) {
-		delete(s.inFlight, ticket.Offset)
-		s.mu.Unlock()
-		return
-	}
-	entry := s.inFlight[ticket.Offset]
-	remaining := 0
-	if entry != nil {
-		remaining = entry.detachWorker(workerID, ticket.IsStolen)
-		if remaining == 0 {
-			delete(s.inFlight, ticket.Offset)
-		}
-	}
-	if remaining == 0 {
-		if s.requeuedPending.Set(ticket.Offset) {
-			s.requeued = append(s.requeued, ticket.Offset)
-			s.requeuedTotal++
-		}
-	}
-	s.broadcastLocked()
+	s.core.releaseTicketLocked(workerID, ticket)
 	s.mu.Unlock()
 }
 
 func (s *adaptiveChunkScheduler) ReenqueueRanges(ranges []int64) int {
-	if len(ranges) < 3 {
-		return 0
-	}
-	rangeChunkSize := ranges[0]
 	s.mu.Lock()
-	if rangeChunkSize <= 0 {
-		rangeChunkSize = s.cursor.chunkSize
-	}
-	enqueued := 0
-	for i := 1; i+1 < len(ranges); i += 2 {
-		start, count := ranges[i], ranges[i+1]
-		if start < 0 || count <= 0 {
-			continue
-		}
-		for j := int64(0); j < count; j++ {
-			offset := start + j*rangeChunkSize
-			if s.cursor.fileSize > 0 && offset >= s.cursor.fileSize {
-				break
-			}
-			inTarget := s.cursor.containsInitialOffset(offset) || s.extraTargets.Test(offset)
-			if !inTarget {
-				s.extraTargets.Set(offset)
-				s.issuedSet.Set(offset)
-				s.total++
-			} else if s.completedSet.Clear(offset) {
-				s.completed--
-			} else if !s.issuedSet.Test(offset) {
-				continue
-			}
-
-			if s.requeuedPending.Set(offset) {
-				s.requeued = append(s.requeued, offset)
-				s.requeuedTotal++
-				enqueued++
-			}
-		}
-	}
-	if enqueued > 0 {
-		s.broadcastLocked()
-	}
+	enqueued := s.core.reenqueueRangesLocked(ranges)
 	s.mu.Unlock()
 	return enqueued
 }
@@ -1171,32 +1122,21 @@ func (s *adaptiveChunkScheduler) ReenqueueRanges(ranges []int64) int {
 func (s *adaptiveChunkScheduler) Stats() SchedulerStats {
 	s.mu.Lock()
 	stats := SchedulerStats{
-		TotalChunks:     s.total,
-		CompletedChunks: s.completed,
-		PendingChunks:   s.pendingCountLocked(),
-		InFlightChunks:  len(s.inFlight),
+		TotalChunks:     s.core.total,
+		CompletedChunks: s.core.completed,
+		PendingChunks:   s.core.pendingCountLocked(),
+		InFlightChunks:  len(s.core.inFlight),
 		StolenChunks:    s.stolenTotal,
-		RequeuedChunks:  s.requeuedTotal,
+		RequeuedChunks:  s.core.requeuedTotal,
 	}
 	s.mu.Unlock()
 	return stats
 }
 
-func (s *adaptiveChunkScheduler) pendingCountLocked() int {
-	return s.cursor.remaining + len(s.requeued)
-}
-
-func (s *adaptiveChunkScheduler) isFinishedLocked() bool {
-	return s.completed == s.total && s.cursor.remaining == 0 && len(s.requeued) == 0
-}
-
 func (s *adaptiveChunkScheduler) healthyPeerCountLocked(excludeWorkerID int, now time.Time, snap *speedSnapshot) int {
 	count := 0
 	for id, lastSeen := range s.workerLastSeen {
-		if id == excludeWorkerID {
-			continue
-		}
-		if now.Sub(lastSeen) > s.cfg.WorkerActiveWindow {
+		if id == excludeWorkerID || now.Sub(lastSeen) > s.cfg.WorkerActiveWindow {
 			continue
 		}
 		if snap.tierOf(id) != WorkerSlow {
@@ -1217,64 +1157,22 @@ func (s *adaptiveChunkScheduler) computeSlowCooldown(medianDur time.Duration) ti
 	return cd
 }
 
-func (s *adaptiveChunkScheduler) popRequeuedLocked(workerID int, now time.Time) (ChunkTicket, bool) {
-	for len(s.requeued) > 0 {
-		offset := s.requeued[0]
-		s.requeued[0] = 0
-		s.requeued = s.requeued[1:]
-		if len(s.requeued) == 0 {
-			s.requeued = nil
-		}
-		s.requeuedPending.Clear(offset)
-		if s.completedSet.Test(offset) {
-			continue
-		}
-		if existing := s.inFlight[offset]; existing != nil {
-			if !existing.hasPrimary {
-				existing.hasPrimary = true
-				existing.primaryWorkerID = workerID
-				existing.primaryStartedAt = now
-				return ChunkTicket{Offset: offset, IsStolen: false}, true
-			}
-			continue
-		}
-		s.issuedSet.Set(offset)
-		s.inFlight[offset] = newInflightChunkState(offset, workerID, now)
-		return ChunkTicket{Offset: offset, IsStolen: false}, true
-	}
-	return ChunkTicket{}, false
-}
-
 func (s *adaptiveChunkScheduler) claimCursorLocked(
 	workerID int,
 	now time.Time,
 	tier WorkerTier,
 	healthyPeers int,
 ) (ChunkTicket, bool) {
-	if s.cursor.remaining == 0 {
+	if s.core.cursor.remaining == 0 {
 		return ChunkTicket{}, false
 	}
-	// Tail Protection: reserve final chunks for healthy peers so a throttled stream
-	// cannot grab the very last chunk and stall transfer completion.
 	if tier == WorkerSlow && healthyPeers > 0 {
 		tailGuard := s.cfg.TailProtectionFactor * healthyPeers
-		if s.cursor.remaining <= tailGuard {
+		if s.core.cursor.remaining <= tailGuard {
 			return ChunkTicket{}, false
 		}
 	}
-
-	for {
-		offset, ok := s.cursor.nextOffset()
-		if !ok {
-			return ChunkTicket{}, false
-		}
-		s.issuedSet.Set(offset)
-		if s.completedSet.Test(offset) {
-			continue
-		}
-		s.inFlight[offset] = newInflightChunkState(offset, workerID, now)
-		return ChunkTicket{Offset: offset, IsStolen: false}, true
-	}
+	return s.core.popCursorSequentialLocked(workerID, now)
 }
 
 func (s *adaptiveChunkScheduler) midStealThreshold(medianDur time.Duration) time.Duration {
@@ -1299,7 +1197,7 @@ func (s *adaptiveChunkScheduler) stealLocked(
 	snap *speedSnapshot,
 	midTransferOnly bool,
 ) (ChunkTicket, bool) {
-	if len(s.inFlight) == 0 {
+	if len(s.core.inFlight) == 0 {
 		return ChunkTicket{}, false
 	}
 	midThresh := s.midStealThreshold(snap.medianDur)
@@ -1309,39 +1207,51 @@ func (s *adaptiveChunkScheduler) stealLocked(
 	var bestElapsed time.Duration
 	bestPrimarySlow := false
 
-	for _, entry := range s.inFlight {
-		if s.completedSet.Test(entry.offset) || !entry.canBeStolenBy(workerID) {
+	for _, entry := range s.core.inFlight {
+		if s.core.completedSet.Test(entry.offset) || !entry.canBeStolenBy(workerID) {
 			continue
 		}
 		elapsed := entry.oldestElapsed(now)
 		primarySlow := entry.hasPrimary && snap.tierOf(entry.primaryWorkerID) == WorkerSlow
-
-		eligible := false
-		if midTransferOnly {
-			eligible = elapsed > midThresh
-		} else {
+		eligible := elapsed > midThresh
+		if !midTransferOnly {
 			eligible = primarySlow || elapsed >= endThresh
 		}
 		if !eligible {
 			continue
 		}
-
-		if best == nil ||
-			(primarySlow && !bestPrimarySlow) ||
-			(primarySlow == bestPrimarySlow && elapsed > bestElapsed) ||
-			(primarySlow == bestPrimarySlow && elapsed == bestElapsed && entry.offset < best.offset) {
+		if isBetterStealVictim(entry, elapsed, primarySlow, best, bestElapsed, bestPrimarySlow) {
 			best = entry
 			bestElapsed = elapsed
 			bestPrimarySlow = primarySlow
 		}
 	}
-
 	if best == nil {
 		return ChunkTicket{}, false
 	}
 	best.attachStealer(workerID, now)
 	s.stolenTotal++
 	return ChunkTicket{Offset: best.offset, IsStolen: true}, true
+}
+
+func isBetterStealVictim(
+	cand *inflightChunkState,
+	candElapsed time.Duration,
+	candSlow bool,
+	best *inflightChunkState,
+	bestElapsed time.Duration,
+	bestSlow bool,
+) bool {
+	if best == nil {
+		return true
+	}
+	if candSlow != bestSlow {
+		return candSlow
+	}
+	if candElapsed != bestElapsed {
+		return candElapsed > bestElapsed
+	}
+	return cand.offset < best.offset
 }
 
 func (s *adaptiveChunkScheduler) nextWaitDurationLocked(
@@ -1354,12 +1264,11 @@ func (s *adaptiveChunkScheduler) nextWaitDurationLocked(
 	if tier == WorkerSlow && healthyPeers > 0 {
 		return s.cfg.SlowMaxCooldown, true
 	}
-
 	endThresh := s.endgameStealThreshold(snap.medianDur)
 	var minRem time.Duration
 	foundCandidate := false
-	for _, entry := range s.inFlight {
-		if s.completedSet.Test(entry.offset) || !entry.canBeStolenBy(workerID) {
+	for _, entry := range s.core.inFlight {
+		if s.core.completedSet.Test(entry.offset) || !entry.canBeStolenBy(workerID) {
 			continue
 		}
 		rem := endThresh - entry.oldestElapsed(now)
