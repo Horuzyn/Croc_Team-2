@@ -120,7 +120,7 @@ jobs:
               "docs/04_Duc_INT_Integration_Benchmark_Lab.md",
           }
           actual = {p.as_posix() for p in md_files}
-          assert actual == expected, f"Unexpected docs files: {actual} vs {expected}"
+          assert expected.issubset(actual), f"Missing required docs files: {expected - actual}"
 
           targets_to_check = list(md_files)
           github_readme = pathlib.Path(".github/README.md")

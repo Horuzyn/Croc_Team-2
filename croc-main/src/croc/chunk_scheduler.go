@@ -7,13 +7,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/schollz/croc/v11/src/message"
+	"github.com/schollz/croc/v11/src/telemetry"
 	"github.com/schollz/croc/v11/src/utils"
 )
 
 const (
-	// FeatureDynamicChunkSchedV1 is advertised during PAKE negotiation when
-	// dynamic multi-TCP chunk scheduling and work-stealing are supported.
-	FeatureDynamicChunkSchedV1 = "dynamic-chunk-sched-v1"
+	// FeatureDynamicChunkSchedV1 aliases the shared PAKE feature flag from message.
+	FeatureDynamicChunkSchedV1 = message.FeatureDynamicChunkSchedV1
 
 	// SchedModeStatic preserves croc's sequential range claiming without work-stealing.
 	SchedModeStatic = "static"
@@ -739,90 +740,6 @@ func normalizeAdaptiveConfig(cfg AdaptiveSchedulerConfig) AdaptiveSchedulerConfi
 	return cfg
 }
 
-// defaultSpeedEstimator provides lightweight built-in EWMA chunk duration tracking
-// when no external StreamTracker (SCH-02) is injected into newAdaptiveChunkScheduler.
-type defaultSpeedEstimator struct {
-	mu      sync.RWMutex
-	workers map[int]*defaultWorkerEWMA
-}
-
-type defaultWorkerEWMA struct {
-	ewmaDur time.Duration
-	samples int
-}
-
-func newDefaultSpeedEstimator() *defaultSpeedEstimator {
-	return &defaultSpeedEstimator{
-		workers: make(map[int]*defaultWorkerEWMA),
-	}
-}
-
-func (e *defaultSpeedEstimator) RecordSendSample(workerID int, _ int, sendDur time.Duration) {
-	if sendDur <= 0 {
-		sendDur = time.Microsecond
-	}
-	e.mu.Lock()
-	st := e.workers[workerID]
-	if st == nil {
-		st = &defaultWorkerEWMA{ewmaDur: sendDur, samples: 1}
-		e.workers[workerID] = st
-	} else {
-		// EWMA alpha = 0.30
-		st.ewmaDur = time.Duration(0.70*float64(st.ewmaDur) + 0.30*float64(sendDur))
-		st.samples++
-	}
-	e.mu.Unlock()
-}
-
-func (e *defaultSpeedEstimator) RecordSteal(_ int) {}
-
-func (e *defaultSpeedEstimator) MedianChunkDuration() time.Duration {
-	e.mu.RLock()
-	var buf [16]time.Duration
-	durs := buf[:0]
-	for _, st := range e.workers {
-		if st.samples > 0 {
-			durs = append(durs, st.ewmaDur)
-		}
-	}
-	e.mu.RUnlock()
-	return medianDuration(durs)
-}
-
-func (e *defaultSpeedEstimator) ClassifyWorker(workerID int) WorkerTier {
-	e.mu.RLock()
-	st := e.workers[workerID]
-	if st == nil || st.samples < 1 || len(e.workers) < 2 {
-		e.mu.RUnlock()
-		return WorkerNormal
-	}
-	workerDur := st.ewmaDur
-	var buf [16]time.Duration
-	durs := buf[:0]
-	for _, w := range e.workers {
-		if w.samples > 0 {
-			durs = append(durs, w.ewmaDur)
-		}
-	}
-	e.mu.RUnlock()
-
-	if len(durs) < 2 {
-		return WorkerNormal
-	}
-	med := medianDuration(durs)
-	if med <= 0 {
-		return WorkerNormal
-	}
-	// Duration > 2.5x median corresponds to throughput < 40% of median.
-	if float64(workerDur) > 2.5*float64(med) {
-		return WorkerSlow
-	}
-	if float64(workerDur) <= 1.15*float64(med) {
-		return WorkerFast
-	}
-	return WorkerNormal
-}
-
 func medianDuration(durs []time.Duration) time.Duration {
 	n := len(durs)
 	if n == 0 {
@@ -898,7 +815,7 @@ func newAdaptiveChunkScheduler(
 		resolvedCfg = DefaultAdaptiveSchedulerConfig()
 	}
 	if inspector == nil {
-		inspector = newDefaultSpeedEstimator()
+		inspector = NewStreamTracker(telemetry.Nop)
 	}
 	cursor := newLazyChunkRangeCursor(ranges, fileSize, chunkSize)
 	effChunkSize := cursor.chunkSize

@@ -85,7 +85,7 @@ flowchart LR
   - **Phụ thuộc:** Nhận spec CLI flag & telemetry từ **Đức (`INT-01`)**; thống nhất chữ ký `ReenqueueRanges` với **Long (`MRK-01`)**.
   - **Tiêu chí hoàn thành (DoD):** Chốt xong thiết kế interface và đảm bảo không giữ lock `mu` khi thực hiện network/disk I/O.
 
-- [ ] **`SCH-02`: Cài đặt Bộ đo Thông lượng từng luồng TCP (`StreamTracker`)** *(Ngày 2)*
+- [x] **`SCH-02`: Cài đặt Bộ đo Thông lượng từng luồng TCP (`StreamTracker`)** *(Ngày 2)*
   - **Mô tả kỹ thuật:** Trong `src/croc/stream_metrics.go`, theo dõi EWMA throughput (`bytes/sec`) và độ trễ trung bình mỗi chunk của từng `workerID`; phân loại luồng `Fast`, `Normal`, `Slow` so với trung vị toàn pool; ghi telemetry JSONL định kỳ (mỗi 200 ms).
   - **Phụ thuộc:** Sử dụng `telemetry.Sink` từ **Đức (`INT-01`)**.
   - **Tiêu chí hoàn thành (DoD):** Unit test `stream_metrics_test.go` phát hiện chính xác một luồng suy giảm tốc độ > 50% trong vòng < 1 giây.
