@@ -3,6 +3,7 @@ package croc
 import (
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -17,25 +18,27 @@ import (
 // requestedChunkQueue manages sender chunk distribution across parallel TCP
 // workers. For small-file bundles (progress != nil) or direct legacy tests it
 // provides sequential range claiming; for regular file transfers (progress == nil)
-// it delegates to ChunkScheduler + StreamTracker (SCH-01..SCH-04).
+// it delegates to ChunkScheduler + StreamTracker (SCH-01..SCH-05).
 type requestedChunkQueue struct {
-	workers    sync.WaitGroup
-	compressed bool
-	progress   func(int64, int)
-	mu         sync.Mutex
-	ranges     []int64
-	next       int   // index of the current range start in ranges
-	step       int64 // chunks already claimed from the current range
-	total      int
-	completed  int
-	done       sync.Once
-	onDone     func()
+	workers           sync.WaitGroup
+	compressed        bool
+	progress          func(int64, int)
+	mu                sync.Mutex
+	ranges            []int64
+	next              int   // index of the current range start in ranges
+	step              int64 // chunks already claimed from the current range
+	total             int
+	completed         int
+	completedByWorker map[int]int
+	done              sync.Once
+	onDone            func()
 
 	scheduler     ChunkScheduler
 	tracker       *StreamTracker
 	unitCtx       context.Context
 	unitCancel    context.CancelFunc
 	activeWorkers atomic.Int32
+	sentPackets   atomic.Int64
 	unitFinished  atomic.Bool
 	closeFileOnce sync.Once
 	closeFileFn   func()
@@ -73,12 +76,16 @@ func (q *requestedChunkQueue) claim() (int64, bool) {
 
 func (q *requestedChunkQueue) complete() {
 	q.mu.Lock()
-	q.completed++
-	finished := q.completed == q.total
+	finished := q.completeLocked()
 	q.mu.Unlock()
 	if finished {
 		q.signalDone()
 	}
+}
+
+func (q *requestedChunkQueue) completeLocked() bool {
+	q.completed++
+	return q.completed == q.total
 }
 
 func (q *requestedChunkQueue) signalDone() {
@@ -121,15 +128,42 @@ func (q *requestedChunkQueue) acquireTicket(workerID int) (ChunkTicket, bool) {
 	return ChunkTicket{Offset: offset}, ok
 }
 
+func (q *requestedChunkQueue) recordPacketSent() {
+	q.sentPackets.Add(1)
+}
+
+func (q *requestedChunkQueue) recordWorkerFirstCompletionLocked(workerID int) {
+	if q.completedByWorker == nil {
+		q.completedByWorker = make(map[int]int)
+	}
+	q.completedByWorker[workerID]++
+}
+
+func (q *requestedChunkQueue) workerChunksSnapshot() map[int]int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.completedByWorker) == 0 {
+		return map[int]int{}
+	}
+	return maps.Clone(q.completedByWorker)
+}
+
 func (q *requestedChunkQueue) completeTicket(workerID int, ticket ChunkTicket, bytesSent int, sendDur time.Duration) bool {
 	if q.scheduler == nil {
-		q.complete()
+		q.mu.Lock()
+		q.recordWorkerFirstCompletionLocked(workerID)
+		finished := q.completeLocked()
+		q.mu.Unlock()
+		if finished {
+			q.signalDone()
+		}
 		return true
 	}
 	first := q.scheduler.Complete(workerID, ticket, bytesSent, sendDur)
 	if first {
 		q.mu.Lock()
 		q.completed++
+		q.recordWorkerFirstCompletionLocked(workerID)
 		q.mu.Unlock()
 	}
 	return first
@@ -265,17 +299,38 @@ func (c *Client) startLateSenderWorker(dataConn *comm.Comm, expectedAttempt *tra
 
 // Detach under the same lock used to admit late workers, then join every
 // admitted worker before a new payload may use these untagged data frames.
-func (c *Client) joinSenderUnit() {
+func (c *Client) joinSenderUnit() int64 {
 	c.senderDataMu.Lock()
 	queue := c.senderChunkQueue
 	c.senderChunkQueue, c.senderDataFile, c.senderDataAttempt = nil, nil, nil
 	c.senderDataMu.Unlock()
-	if queue != nil {
-		queue.cancelUnit()
-		queue.workers.Wait()
-		queue.stopTracker()
-		queue.closeFileSafe()
+	if queue == nil {
+		return 0
 	}
+	queue.cancelUnit()
+	queue.workers.Wait()
+	queue.stopTracker()
+	queue.closeFileSafe()
+
+	snapshot := queue.workerChunksSnapshot()
+	c.senderDataMu.Lock()
+	c.lastWorkerChunks = snapshot
+	c.senderDataMu.Unlock()
+	return queue.sentPackets.Load()
+}
+
+// LastSenderWorkerChunks returns an immutable copy of per-worker first-completed
+// chunk counts from the most recently finished sender file unit (SCH-05).
+func (c *Client) LastSenderWorkerChunks() map[int]int {
+	c.senderDataMu.Lock()
+	defer c.senderDataMu.Unlock()
+	if c.senderChunkQueue != nil {
+		return c.senderChunkQueue.workerChunksSnapshot()
+	}
+	if len(c.lastWorkerChunks) == 0 {
+		return map[int]int{}
+	}
+	return maps.Clone(c.lastWorkerChunks)
 }
 
 // ReenqueueRanges schedules corrupted or missing chunk ranges (in standard

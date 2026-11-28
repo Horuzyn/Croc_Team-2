@@ -275,7 +275,11 @@ type Client struct {
 	lastNetSendNs              atomic.Int64
 	netSendObserverMu          sync.RWMutex
 	netSendObserver            func(time.Duration)
+	lastWorkerChunks           map[int]int
+	inflightReceiveChunks      pagedChunkBitset
 	receivedChunks             pagedChunkBitset
+	recvDataPackets            int64
+	recvDrainNotify            chan struct{}
 	peerInlineMetadata         bool
 	peerProgressiveHash        bool
 	peerChunkedFileInfo        bool
@@ -3265,7 +3269,7 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 			}
 		}
 	case message.TypeCloseSender:
-		c.joinSenderUnit()
+		sentPackets := c.joinSenderUnit()
 		c.finishProgress()
 		log.Debug("close-sender received...")
 		c.updateLifecycle(func(state *transferLifecycle) {
@@ -3274,13 +3278,19 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 		})
 		log.Debug("sending close-recipient")
 		err = message.Send(c.connection(0), c.Key, message.Message{
-			Type: message.TypeCloseRecipient,
+			Type:  message.TypeCloseRecipient,
+			Bytes: encodeSentPacketsPayload(sentPackets, c.effectiveSchedMode() == SchedModeDynamic),
 		})
 	case message.TypeCloseRecipient:
-		c.updateLifecycle(func(state *transferLifecycle) {
-			state.FileTransferred = false
-			state.RecipientRequested = false
-		})
+		if sentPackets, ok := decodeSentPacketsPayload(m.Bytes); ok {
+			err = c.waitForReceivePacketDrain(attempt, sentPackets)
+		}
+		if err == nil {
+			c.updateLifecycle(func(state *transferLifecycle) {
+				state.FileTransferred = false
+				state.RecipientRequested = false
+			})
+		}
 	}
 	if err != nil {
 		log.Debugf("got error from processing message: %v", c.redactError(err))
@@ -3380,7 +3390,12 @@ func (c *Client) recipientInitializeFile() (err error) {
 		os.O_RDWR, 0o666)
 	var truncate bool // default false
 	c.CurrentFileChunkRanges = []int64{}
+	c.inflightReceiveChunks = newPagedChunkBitset(models.TCP_BUFFER_SIZE / 2)
 	c.receivedChunks = newPagedChunkBitset(models.TCP_BUFFER_SIZE / 2)
+	c.recvDataPackets = 0
+	if c.recvDrainNotify == nil {
+		c.recvDrainNotify = make(chan struct{}, 1)
+	}
 	if errOpen == nil {
 		stat, _ := c.CurrentFile.Stat()
 		truncate = stat.Size() != c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
@@ -3439,6 +3454,11 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 	if err == nil {
 		c.TotalSent = 0
 		c.TotalChunksTransferred = 0
+		c.CurrentFileChunkCount = utils.ChunkRangesCount(
+			c.CurrentFileChunkRanges,
+			c.FilesToTransfer[c.FilesToTransferCurrentNum].Size,
+			models.TCP_BUFFER_SIZE/2,
+		)
 		c.CurrentFileIsClosed = false
 	}
 	c.receiveMutex.Unlock()
@@ -3458,11 +3478,6 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 		ReconnectVersion:          c.reconnectVersion,
 		Features:                  []string{perFileCompressionFeature},
 	})
-	c.CurrentFileChunkCount = utils.ChunkRangesCount(
-		c.CurrentFileChunkRanges,
-		c.FilesToTransfer[c.FilesToTransferCurrentNum].Size,
-		models.TCP_BUFFER_SIZE/2,
-	)
 
 	if !finished {
 		// setup the progressbar
@@ -3822,29 +3837,8 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 			}
 			continue
 		}
-		if c.currentFileUsesCompression() {
-			data, err = compress.DecompressTo(decompressedBuffer, data, maxDecompressedChunkSize)
-			if err != nil {
-				attempt.report(fmt.Errorf("decompress data chunk: %w", err))
-				return
-			}
-			decompressedBuffer = data
-		}
-		if len(data) < 9 || len(data) > maxDecompressedChunkSize {
-			attempt.report(fmt.Errorf("invalid data chunk size: %d", len(data)))
-			return
-		}
-
-		// get position
-		position := binary.LittleEndian.Uint64(data[:8])
-		fileSize := c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
-		if err = chunkFits(fileSize, position, len(data)-8); err != nil {
-			attempt.report(fmt.Errorf("invalid data chunk bounds: %w", err))
-			return
-		}
-		positionInt64 := int64(position)
-
 		c.receiveMutex.Lock()
+		c.noteReceivedDataPacketLocked()
 		if c.CurrentFileIsClosed || c.CurrentFile == nil {
 			c.receiveMutex.Unlock()
 			if c.dynamicSchedReceiveActive() && c.ctxErr() == nil {
@@ -3871,13 +3865,54 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 			}
 			return
 		}
+		useCompression := c.currentFileUsesCompression()
+		fileSize := c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
 		receiveFile := c.CurrentFile
+		c.receiveMutex.Unlock()
+
+		if useCompression {
+			data, err = compress.DecompressTo(decompressedBuffer, data, maxDecompressedChunkSize)
+			if err != nil {
+				attempt.report(fmt.Errorf("decompress data chunk: %w", err))
+				return
+			}
+			decompressedBuffer = data
+		}
+		if len(data) < 9 || len(data) > maxDecompressedChunkSize {
+			attempt.report(fmt.Errorf("invalid data chunk size: %d", len(data)))
+			return
+		}
+
+		position := binary.LittleEndian.Uint64(data[:8])
+		if err = chunkFits(fileSize, position, len(data)-8); err != nil {
+			attempt.report(fmt.Errorf("invalid data chunk bounds: %w", err))
+			return
+		}
+		positionInt64 := int64(position)
+
+		c.receiveMutex.Lock()
+		if c.CurrentFileIsClosed || c.CurrentFile != receiveFile {
+			c.receiveMutex.Unlock()
+			if c.dynamicSchedReceiveActive() && c.ctxErr() == nil {
+				continue
+			}
+			return
+		}
+		if c.dynamicSchedReceiveActive() && !c.inflightReceiveChunks.Set(positionInt64) {
+			c.receiveMutex.Unlock()
+			continue
+		}
 		c.receiveMutex.Unlock()
 
 		// os.File supports concurrent WriteAt calls. Keep disk I/O outside the
 		// state lock so all relay connections can write in parallel.
 		_, err = receiveFile.WriteAt(data[8:], positionInt64)
 		if err != nil {
+			if c.dynamicSchedReceiveActive() {
+				c.receiveMutex.Lock()
+				c.inflightReceiveChunks.Clear(positionInt64)
+				c.receiveMutex.Unlock()
+			}
 			attempt.report(err)
 			return
 		}
@@ -3898,8 +3933,8 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 			c.TotalSent += int64(len(data[8:]))
 			c.TotalChunksTransferred++
 		}
-		finished := c.TotalChunksTransferred == c.CurrentFileChunkCount ||
-			c.TotalSent == c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
+		finished := firstArrival && (c.TotalChunksTransferred == c.CurrentFileChunkCount ||
+			(len(c.CurrentFileChunkRanges) == 0 && c.TotalSent == fileSize))
 		if finished {
 			c.CurrentFileIsClosed = true
 		}
@@ -4070,6 +4105,7 @@ func (c *Client) sendData(i int, dataConn *comm.Comm, fread *os.File, queue *req
 				}
 				return
 			}
+			queue.recordPacketSent()
 			c.recordNetSendDuration(netSendDuration)
 
 			if queue.completeTicket(i, ticket, n, netSendDuration) {

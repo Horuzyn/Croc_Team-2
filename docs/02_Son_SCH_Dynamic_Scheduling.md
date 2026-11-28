@@ -100,7 +100,7 @@ flowchart LR
   - **Phụ thuộc:** Phối hợp **Nam (`CMP-04`)** tại `sendData`; mở đường cho **Long (`MRK-05`)**.
   - **Tiêu chí hoàn thành (DoD):** Truyền file 100–800 MB qua 4–8 luồng TCP ổn định; cờ `--sched static` chạy lại đúng hành vi cũ để benchmark A/B.
 
-- [ ] **`SCH-05`: Xử lý Idempotent Receive & Test Bóp băng thông 1 Luồng** *(Ngày 4)*
+- [x] **`SCH-05`: Xử lý Idempotent Receive & Test Bóp băng thông 1 Luồng** *(Ngày 4)*
   - **Mô tả kỹ thuật:** Vì work-stealing có thể gửi lặp 1 chunk từ 2 luồng khác nhau, bổ sung bitmap/set đánh dấu `offset` đã nhận trong `receiveData` để ghi đè an toàn và **không cộng đúp** `TotalReceived` / `ChunkCount`. Viết `dynamic_sched_test.go` kiểm thử bóp băng thông 1 luồng xuống 512 KB/s.
   - **Phụ thuộc:** Phối hợp **Long (`MRK-04`)** ở luồng nhận và **Đức (`INT-03`)** cho script `tc`.
   - **Tiêu chí hoàn thành (DoD):** Khi 1 luồng bị bóp tốc độ, các luồng nhanh gánh > 85% tổng lượng chunk và loại bỏ hiện tượng chờ luồng chậm ở cuối file.
