@@ -221,6 +221,11 @@ func newApp() *cli.App {
 		&cli.StringFlag{Name: "socks5", Value: "", Usage: "SOCKS5 proxy address (relay DNS is resolved by the proxy)", EnvVars: []string{"SOCKS5_PROXY"}},
 		&cli.StringFlag{Name: "connect", Value: "", Usage: "add a http proxy", EnvVars: []string{"HTTP_PROXY"}},
 		&cli.StringFlag{Name: "throttleUpload", Value: "", Usage: "throttle the upload speed e.g. 500k"},
+		&cli.BoolFlag{Name: "adaptive-compress", Usage: "choose compression per chunk"},
+		&cli.StringFlag{Name: "sched", Value: "dynamic", Usage: "chunk scheduler for data streams (dynamic, static)"},
+		&cli.BoolFlag{Name: "merkle-resume", Usage: "verify chunks and resend only damaged ones on resume"},
+		&cli.StringFlag{Name: "metrics-out", Usage: "append transfer metrics to this JSON Lines file"},
+		&cli.StringFlag{Name: "debug-throttle-worker", Usage: "testing: throttle one data stream, <id>:<rate> e.g. 0:512k"},
 	}
 	app.EnableBashCompletion = true
 	app.HideHelp = false
@@ -683,6 +688,13 @@ func send(c *cli.Context) (err error) {
 		ExtendedClipboard: c.Bool("extended-clipboard"),
 		NoUpdateCheck:     c.Bool("no-update-check"),
 		Transport:         transport,
+
+		// Croc_Team-2 upgrades.
+		AdaptiveCompress:    c.Bool("adaptive-compress"),
+		SchedMode:           c.String("sched"),
+		MerkleResume:        c.Bool("merkle-resume"),
+		MetricsOut:          c.String("metrics-out"),
+		DebugThrottleWorker: c.String("debug-throttle-worker"),
 	}
 	if crocOptions.RelayAddress != models.DEFAULT_RELAY {
 		crocOptions.RelayAddress6 = ""
@@ -1007,6 +1019,13 @@ func receive(c *cli.Context) (err error) {
 		ExtendedClipboard: c.Bool("extended-clipboard"),
 		NoUpdateCheck:     c.Bool("no-update-check"),
 		Transport:         croc.TransportAuto,
+
+		// Croc_Team-2 upgrades.
+		AdaptiveCompress:    c.Bool("adaptive-compress"),
+		SchedMode:           c.String("sched"),
+		MerkleResume:        c.Bool("merkle-resume"),
+		MetricsOut:          c.String("metrics-out"),
+		DebugThrottleWorker: c.String("debug-throttle-worker"),
 	}
 	if crocOptions.RelayAddress != models.DEFAULT_RELAY {
 		crocOptions.RelayAddress6 = ""
